@@ -7,6 +7,7 @@ talk to ERPNext through its REST API.
 ```
 services/mes/         Production shop-floor service (Go): Work Order sync, start/stop, output, outbox to ERPNext
 services/wms-bridge/  Copies the WMS (production-pos) stock ledger into ERPNext as Stock Entries (Go)
+services/cerp-bridge/ Books ConstructionERP purchase orders in ERPNext, company KGF Construction (Go)
 internal/             Shared Go packages: ERPNext REST client, PostgreSQL store and migrations
 apps/floor/     Shop-floor tablet screen (SvelteKit, Bun, Tailwind) on top of the MES API
 scripts/        End-to-end tests against a running ERPNext + services
@@ -83,6 +84,34 @@ the bridge does the same when the WMS receives finished goods before the MES rep
 
 The ERPNext integration user needs Stock User + Stock Manager + Item Manager (for masters).
 
+## ConstructionERP bridge (`services/cerp-bridge`)
+
+Decided 2026-11-18: **ConstructionERP buys, ERPNext books**, and the construction business is its own
+company in ERPNext (`KGF Construction`, abbr KGFC, set up by `kgarden.construction.setup.ensure`).
+ConstructionERP keeps PR → PO → approval (Thai numbering, VAT, WHT, budget check); ERPNext owns
+suppliers, projects, accounts, VAT and AP. The bridge reads ConstructionERP with a read-only role
+(`cerp_bridge`) and uses its own ERPNext user `cerp.integration@example.com`.
+
+| ConstructionERP | ERPNext |
+|---|---|
+| contact (vendor) | Supplier, matched by `kg_cerp_id`, else adopted by tax ID, else created |
+| project | Project (`kg_cerp_id`) in KGF Construction |
+| PO approved / issued / partially received / completed | one submitted Purchase Order (`kg_cerp_po_number`, `kg_idempotency_key`) |
+| PO line `cost_category` | non-stock item CON-MATERIAL / LABOR / SUBCONTRACT / EQUIPMENT / OTHER; text, unit, qty, rate kept |
+| `vat_mode` exclusive / inclusive / none | VAT row on `CERP_BRIDGE_VAT_ACCOUNT` (inclusive = included in rate) / none |
+| WHT (type, rate, amount) | written in the PO terms; booked later on the purchase invoice / payment |
+
+- Every PO version (content hash) gets its own key `cerp-po-<id>-<hash>`. An approved PO sent back
+  to draft and edited, then approved again, cancels the old ERPNext PO and books a new one; draft or
+  cancelled leaves no submitted ERPNext PO. Issuing or receiving does not create a new version.
+- A PO is submitted only if ERPNext's grand total equals ConstructionERP's `amount_total`; otherwise it
+  stays a draft with the difference in `last_error`.
+- Polls `updated_at` every 5 s with a 5-minute look-back; failures back off and go `dead` after 10.
+- API: `GET /purchase-orders?status=pending|synced|dead`, `POST /purchase-orders/{id}/retry`.
+
+Not done yet: goods receipts, supplier invoices with WHT, payments (ConstructionERP's own ledger is
+to be retired for these).
+
 ### Tablet screen (`apps/floor`)
 
 Operator signs in by name, picks an open Work Order, starts/stops the job and reports good and scrap
@@ -110,6 +139,9 @@ go build -o bin/ ./services/...
 scripts/e2e_production.sh
 WMS_APP_DIR=~/Desktop/production-pos/point-of-sales scripts/e2e_wms_bridge.sh   # local WMS copy only
 WMS_APP_DIR=~/Desktop/production-pos/point-of-sales scripts/e2e_wip_flow.sh      # WMS → WIP → MES → WMS
+./bin/cerp-bridge migrate && ./bin/cerp-bridge serve
+CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_bridge.sh                       # local ConstructionERP only
+scripts/reconcile.sh   # read-only: does ERPNext hold exactly what WMS, ConstructionERP and MES say happened?
 ```
 
 Local WMS copy: MySQL container `kgarden-wms-mysql` on 127.0.0.1:13306 (the WMS `.env` points there),

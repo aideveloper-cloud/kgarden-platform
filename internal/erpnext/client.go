@@ -263,3 +263,28 @@ func IsNegativeStock(err error) bool {
 	var ee *Error
 	return errors.As(err, &ee) && ee.ExcType == "NegativeStockError"
 }
+
+// Update changes fields of an existing document and returns it.
+func (c *Client) Update(ctx context.Context, doctype, name string, fields map[string]any) (map[string]any, error) {
+	var out struct {
+		Data map[string]any `json:"data"`
+	}
+	err := c.do(ctx, http.MethodPut, "/api/resource/"+url.PathEscape(doctype)+"/"+url.PathEscape(name), nil, fields, &out)
+	return out.Data, err
+}
+
+// Cancel cancels a submitted document (docstatus 1 -> 2).
+func (c *Client) Cancel(ctx context.Context, doctype, name string) error {
+	return c.do(ctx, http.MethodPost, "/api/method/frappe.client.cancel", nil,
+		map[string]any{"doctype": doctype, "name": name}, nil)
+}
+
+// FindByField returns the name and docstatus of the first document whose field equals value.
+func (c *Client) FindByField(ctx context.Context, doctype, field, value string) (name string, docstatus int, err error) {
+	rows, err := c.List(ctx, doctype, []string{"name", "docstatus"}, [][]any{{field, "=", value}}, 1)
+	if err != nil || len(rows) == 0 {
+		return "", 0, err
+	}
+	ds, _ := rows[0]["docstatus"].(float64)
+	return rows[0]["name"].(string), int(ds), nil
+}
