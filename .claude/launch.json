@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "floor", "runtimeExecutable": "bun", "runtimeArgs": ["run", "--cwd", "apps/floor", "dev"], "port": 5180 }
+  ]
+}
