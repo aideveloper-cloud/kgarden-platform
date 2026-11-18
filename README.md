@@ -66,11 +66,21 @@ People and their access to every K Garden app are managed in one place: the User
   WMS access. ERPNext role → WMS role: superadmin → super-admin, admin/supervisor → warehouse-admin,
   operator → warehouse-pos; scopes (ERPNext warehouses) → user_outlets. While the flag is off the WMS
   works exactly as before (warehouse PINs, local passwords).
+- **ConstructionERP (branch `feat/th-kgarden-access`, `KGARDEN_ACCESS_ENABLED` + its OIDC settings)**:
+  its existing OIDC sign-in now works with ERPNext (authorization endpoint from discovery, `state`,
+  client secret posted, empty `sub` falls back to the email) and fixes a returning-user refusal.
+  ERPNext role → local role: superadmin/admin → admin, project_manager/approver → manager,
+  accountant/purchaser → editor, viewer → viewer (`KGARDEN_ROLE_MAP` overrides). Project scope →
+  membership of a "K Garden access" team per project (no scope = every project); cerp-bridge copies
+  every ConstructionERP project into ERPNext so any project can be granted. Password login only for
+  `KGARDEN_LOCAL_LOGIN`. A poller (`KGARDEN_ACCESS_POLL_SECONDS`) ends sessions on lost access or a new
+  role (`password_changed_at`).
 
 ```bash
 ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_access.sh     # 25 checks through the real sign-in flow (local site only)
 ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_mes_auth.sh   # 16 checks: MES PIN + ERPNext sign-in, revocation, roles
 ERPNEXT_ADMIN_PASSWORD=... WMS_URL=http://127.0.0.1:8300 WMS_APP_DIR=... scripts/e2e_wms_auth.sh   # 14 checks
+ERPNEXT_ADMIN_PASSWORD=... CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_auth.sh   # 11 checks
 ```
 
 ## WMS bridge (`services/wms-bridge`)

@@ -99,6 +99,10 @@ func serve(ctx context.Context) error {
 			} else if n > 0 {
 				slog.Info("purchase orders reconciled", "count", n)
 			}
+			// Every project, so access to any project can be granted in ERPNext.
+			if _, err := poster.SyncProjects(ctx, cerp); err != nil {
+				slog.Warn("sync projects", "err", err)
+			}
 			// Receipts, invoices and payments after the POs they depend on.
 			if n, err := reader.PollDocs(ctx); err != nil {
 				slog.Error("read constructionerp documents", "err", err)
