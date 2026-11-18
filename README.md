@@ -58,10 +58,19 @@ People and their access to every K Garden app are managed in one place: the User
   KG User PIN) checked by `kgarden.access.api.verify_pin` with the app's service account
   (role `KG Access Service`); rate-limited per employee code.
 - Integration accounts (`integration@`, `cerp.integration@`) are not managed by this form.
+- **WMS (production-pos, branch `feat/kgarden-access`, `KGARDEN_ACCESS_ENABLED`)**: POS tablets unlock
+  with employee code + PIN at a chosen warehouse (verify_pin with the warehouse as scope, service account
+  `wms.access@example.com`), the cut/receipt operator is that person; the dashboard has
+  "เข้าสู่ระบบด้วย K Garden"; password login only for `KGARDEN_LOCAL_LOGIN` (break-glass);
+  `php artisan kgarden:sync-access` (every minute) strips rights and ends sessions of people who lost
+  WMS access. ERPNext role → WMS role: superadmin → super-admin, admin/supervisor → warehouse-admin,
+  operator → warehouse-pos; scopes (ERPNext warehouses) → user_outlets. While the flag is off the WMS
+  works exactly as before (warehouse PINs, local passwords).
 
 ```bash
 ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_access.sh     # 25 checks through the real sign-in flow (local site only)
 ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_mes_auth.sh   # 16 checks: MES PIN + ERPNext sign-in, revocation, roles
+ERPNEXT_ADMIN_PASSWORD=... WMS_URL=http://127.0.0.1:8300 WMS_APP_DIR=... scripts/e2e_wms_auth.sh   # 14 checks
 ```
 
 ## WMS bridge (`services/wms-bridge`)
