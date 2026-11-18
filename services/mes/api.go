@@ -16,19 +16,32 @@ import (
 type API struct {
 	store *pgstore.Store
 	sync  *Syncer
+	auth  *Auth
 }
 
+// Routes: everything but /healthz and sign-in needs a session from ERPNext-managed access.
+// Operators and supervisors work the floor; only supervisors pull Work Orders and read the outbox.
 func (a *API) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
-	mux.HandleFunc("POST /sync/work-orders", a.syncWorkOrders)
-	mux.HandleFunc("GET /work-orders", a.listWorkOrders)
-	mux.HandleFunc("GET /work-orders/{name}", a.getWorkOrder)
-	mux.HandleFunc("POST /work-orders/{name}/start", a.startOperation)
-	mux.HandleFunc("POST /work-orders/{name}/stop", a.stopOperation)
-	mux.HandleFunc("POST /work-orders/{name}/output", a.reportOutput)
-	mux.HandleFunc("GET /outbox", a.listOutbox)
+	a.auth.Routes(mux)
+	floor := []string{"operator", "supervisor"}
+	mux.HandleFunc("POST /sync/work-orders", a.auth.Require(a.syncWorkOrders, "supervisor"))
+	mux.HandleFunc("GET /work-orders", a.auth.Require(a.listWorkOrders, floor...))
+	mux.HandleFunc("GET /work-orders/{name}", a.auth.Require(a.getWorkOrder, floor...))
+	mux.HandleFunc("POST /work-orders/{name}/start", a.auth.Require(a.startOperation, floor...))
+	mux.HandleFunc("POST /work-orders/{name}/stop", a.auth.Require(a.stopOperation, floor...))
+	mux.HandleFunc("POST /work-orders/{name}/output", a.auth.Require(a.reportOutput, floor...))
+	mux.HandleFunc("GET /outbox", a.auth.Require(a.listOutbox, "supervisor"))
 	return mux
+}
+
+// operatorOf is who did it: the signed-in person, never a name typed into the request.
+func operatorOf(r *http.Request) string {
+	if s := sessionFrom(r); s != nil {
+		return s.Label()
+	}
+	return ""
 }
 
 type httpError struct {
@@ -164,10 +177,7 @@ func (a *API) startOperation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if strings.TrimSpace(req.Operator) == "" {
-		writeErr(w, fail(400, "operator is required"))
-		return
-	}
+	req.Operator = operatorOf(r)
 	var id string
 	err := a.store.Tx(r.Context(), func(tx pgx.Tx) error {
 		if _, err := lockOpenWorkOrder(r, tx, name); err != nil {
@@ -197,6 +207,7 @@ func (a *API) stopOperation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	req.Operator = operatorOf(r)
 	var id string
 	err := a.store.Tx(r.Context(), func(tx pgx.Tx) error {
 		err := tx.QueryRow(r.Context(), `UPDATE mes.operation_log SET ended_at = now(), note = CASE WHEN $2 = '' THEN note ELSE $2 END
@@ -245,10 +256,7 @@ func (a *API) reportOutput(w http.ResponseWriter, r *http.Request) {
 	if req.ScrapQty == "" {
 		req.ScrapQty = "0"
 	}
-	if strings.TrimSpace(req.Operator) == "" {
-		writeErr(w, fail(400, "operator is required"))
-		return
-	}
+	req.Operator = operatorOf(r)
 
 	var outputID, status string
 	replayed := false

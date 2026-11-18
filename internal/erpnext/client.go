@@ -306,3 +306,28 @@ func CleanDoc(v any) any { return cleanDoc(v) }
 func (c *Client) Delete(ctx context.Context, doctype, name string) error {
 	return c.do(ctx, http.MethodDelete, "/api/resource/"+url.PathEscape(doctype)+"/"+url.PathEscape(name), nil, nil, nil)
 }
+
+// GetMethod calls a whitelisted GET method and decodes its message into out.
+func (c *Client) GetMethod(ctx context.Context, method string, query url.Values, out any) error {
+	var wrap struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/method/"+method, query, nil, &wrap); err != nil {
+		return err
+	}
+	return json.Unmarshal(wrap.Message, out)
+}
+
+// PostMethod calls a whitelisted POST method and decodes its message into out.
+func (c *Client) PostMethod(ctx context.Context, method string, args map[string]any, out any) error {
+	var wrap struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/api/method/"+method, nil, args, &wrap); err != nil {
+		return err
+	}
+	return json.Unmarshal(wrap.Message, out)
+}
+
+// Base is the ERPNext URL the client talks to.
+func (c *Client) Base() string { return c.base }

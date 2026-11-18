@@ -30,7 +30,12 @@ check() {
 }
 num() { jq -n "($1) + 0"; }
 erp() { curl -sS -X "$1" -H "$AUTH" -H "Content-Type: application/json" "$ERP$2" ${3:+--data "$3"}; }
-mes() { curl -sS -X "$1" -H "Content-Type: application/json" ${4:+-H "Idempotency-Key: $4"} "$MES$2" ${3:+--data "$3"}; }
+# The MES needs a session: sign in as the test supervisor (employee code + PIN managed in ERPNext).
+JAR=$(mktemp); trap 'rm -f "$JAR"' EXIT
+curl -sS -c "$JAR" -X POST "$MES/auth/pin" -H 'Content-Type: application/json' \
+	--data "$(jq -cn --arg c "${MES_E2E_SUPERVISOR:?}" --arg p "${MES_E2E_SUPERVISOR_PIN:?}" '{employee_code:$c, pin:$p}')" | jq -e .role >/dev/null \
+	|| { echo "MES sign-in failed"; exit 1; }
+mes() { curl -sS -b "$JAR" -X "$1" -H "Content-Type: application/json" ${4:+-H "Idempotency-Key: $4"} "$MES$2" ${3:+--data "$3"}; }
 pg() { psql "${MES_DB_OWNER_URL:?}" -qtAc "$1"; }
 bin_qty() { # item erpnext-warehouse
 	erp GET "/api/resource/Bin?fields=%5B%22actual_qty%22%5D&filters=$(jq -rn --arg i "$1" --arg w "$2" '[["item_code","=",$i],["warehouse","=",$w]]|tojson|@uri')" | jq '.data[0].actual_qty // 0'

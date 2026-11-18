@@ -36,6 +36,34 @@ Scrap is recorded in `mes.scrap_log` only; posting it to ERPNext is not done yet
 | POST | `/sync/work-orders` | pull Work Orders from ERPNext now |
 | GET | `/outbox?status=pending\|sent\|dead` | outbox state, errors |
 
+## App access, managed in ERPNext (`kgarden` app, `kgarden.access`)
+
+People and their access to every K Garden app are managed in one place: the User form in ERPNext
+(Roles & Permissions tab, "K Garden: สิทธิ์เข้าใช้แอป"). Decided 2026-11-18.
+
+- **KG App** lists the apps (ERPNEXT desk, WMS, CERP, MES_FLOOR) with their roles and scope
+  (WMS: Warehouse, CERP: Project). Each app has an access role `KG App: <code>`.
+- A user's table **แอปที่เข้าใช้ได้** grants app + role (+ scope). Not in the table = cannot use the app.
+  **ผู้ดูแลระบบสูงสุด** (`KG Super Admin`) opens every app as admin. Only a super admin may change
+  these fields; everything is logged in the user's activity.
+- Saving the user syncs Frappe roles: the access role of each granted app, the ERPNext roles of the
+  desk app's role (no desk app = Website User, no desk), KG Super Admin + System Manager for a super admin.
+- **Sign-in (OpenID Connect):** each app has an OAuth Client in ERPNext allowing only its access role
+  and KG Super Admin, so ERPNext itself refuses to sign anyone else in (a Thai "ไม่มีสิทธิ์เข้าใช้" page).
+  The userinfo (`frappe.integrations.oauth2.openid_profile`) adds `kg_app`, `kg_role`, `kg_scopes`,
+  `kg_scope_doctype`, `kg_superadmin`, `kg_employee_code` for the app asking.
+- **Losing access** (row removed, user disabled) revokes that app's OAuth tokens at once; apps poll
+  `kgarden.access.api.access_changes` to end their own sessions.
+- **Shared floor tablets:** employee code + PIN (`set_pin` by a super admin, stored as a hash in
+  KG User PIN) checked by `kgarden.access.api.verify_pin` with the app's service account
+  (role `KG Access Service`); rate-limited per employee code.
+- Integration accounts (`integration@`, `cerp.integration@`) are not managed by this form.
+
+```bash
+ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_access.sh     # 25 checks through the real sign-in flow (local site only)
+ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_mes_auth.sh   # 16 checks: MES PIN + ERPNext sign-in, revocation, roles
+```
+
 ## WMS bridge (`services/wms-bridge`)
 
 The WMS (production-pos, Laravel + MySQL) keeps the physical stock: units, spools, FIFO, PIN-locked
@@ -124,9 +152,28 @@ Receipts, invoices and payments (`cerp_bridge.doc_state`, posted after the POs t
 - Not booked yet: invoices with retention, supplier refunds, credit notes.
 - API: `GET /documents?kind=receipt|invoice|payment&status=...`, `POST /documents/{kind}/{id}/retry`.
 
+### Signing in to the MES (`services/mes/auth.go`)
+
+Who may use the floor tablet, and as what, is set in ERPNext (app MES_FLOOR: operator, supervisor;
+super admins and Administrator get every app). Two ways in, both decided by ERPNext:
+
+- **Employee code + PIN** on a shared tablet: `POST /auth/pin`, checked by
+  `kgarden.access.api.verify_pin` with the MES service account (`MES_ACCESS_API_KEY/SECRET`, role
+  KG Access Service only).
+- **"เข้าสู่ระบบด้วย K Garden"**: OpenID Connect against ERPNext (`GET /auth/oidc/start`, ERPNext sign-in
+  page, back to the tablet's `/auth/callback`, `POST /auth/oidc/callback`; the code is exchanged server
+  side with `MES_OIDC_CLIENT_ID/SECRET`; the state is single use).
+
+The MES then issues its own session (HttpOnly cookie, stored hashed in `mes.session`, `MES_SESSION_TTL`,
+default 12h). Every API call except `/healthz` and `/auth/*` needs it; operators and supervisors work
+the floor, only supervisors pull Work Orders and read the outbox. The operator of every action is the
+signed-in person ("ชื่อ (รหัสพนักงาน)"), never a name sent in the request. Sessions end on logout, after
+10 minutes without a touch on the tablet, or within `MES_ACCESS_POLL` (default 1m) when ERPNext reports
+the person lost MES access or got another role.
+
 ### Tablet screen (`apps/floor`)
 
-Operator signs in by name, picks an open Work Order, starts/stops the job and reports good and scrap
+Operator signs in (employee code + PIN, or through ERPNext), picks an open Work Order, starts/stops the job and reports good and scrap
 quantity on a large keypad (scrap needs a reason). Each report carries an `Idempotency-Key`; if the send
 fails on the network or a 5xx, the values are locked and "ส่งซ้ำ" resends the same key, so a retry is never
 counted twice. The screen refreshes every 3 s and shows whether each report has reached ERPNext.
