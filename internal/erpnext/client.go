@@ -288,3 +288,21 @@ func (c *Client) FindByField(ctx context.Context, doctype, field, value string) 
 	ds, _ := rows[0]["docstatus"].(float64)
 	return rows[0]["name"].(string), int(ds), nil
 }
+
+// CallMethod calls a whitelisted ERPNext method (POST) and returns its message as a document,
+// e.g. a mapper such as make_purchase_receipt that builds an unsaved document from another.
+func (c *Client) CallMethod(ctx context.Context, method string, args map[string]any) (map[string]any, error) {
+	var out struct {
+		Message map[string]any `json:"message"`
+	}
+	err := c.do(ctx, http.MethodPost, "/api/method/"+method, nil, args, &out)
+	return out.Message, err
+}
+
+// CleanDoc drops client-side bookkeeping keys (__islocal, unsaved names) from a mapped document.
+func CleanDoc(v any) any { return cleanDoc(v) }
+
+// Delete removes a document; used only for drafts the integration itself left behind.
+func (c *Client) Delete(ctx context.Context, doctype, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/resource/"+url.PathEscape(doctype)+"/"+url.PathEscape(name), nil, nil, nil)
+}

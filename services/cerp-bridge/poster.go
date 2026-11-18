@@ -20,6 +20,7 @@ import (
 type Config struct {
 	Company       string // ERPNext company the construction business books in
 	VATAccount    string // input VAT account of that company
+	WHTAccount    string // Thai WHT deducted from supplier payments, owed to the Revenue Department
 	SupplierGroup string
 	MaxAttempts   int
 }

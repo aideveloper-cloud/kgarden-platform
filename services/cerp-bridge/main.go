@@ -80,6 +80,7 @@ func serve(ctx context.Context) error {
 	poster := &Poster{store: store, erp: erp, known: map[string]bool{}, cfg: Config{
 		Company:       mustEnv("CERP_BRIDGE_COMPANY"),
 		VATAccount:    mustEnv("CERP_BRIDGE_VAT_ACCOUNT"),
+		WHTAccount:    mustEnv("CERP_BRIDGE_WHT_ACCOUNT"),
 		SupplierGroup: mustEnv("CERP_BRIDGE_SUPPLIER_GROUP"),
 		MaxAttempts:   10,
 	}}
@@ -97,6 +98,17 @@ func serve(ctx context.Context) error {
 				slog.Error("book in erpnext", "err", err)
 			} else if n > 0 {
 				slog.Info("purchase orders reconciled", "count", n)
+			}
+			// Receipts, invoices and payments after the POs they depend on.
+			if n, err := reader.PollDocs(ctx); err != nil {
+				slog.Error("read constructionerp documents", "err", err)
+			} else if n > 0 {
+				slog.Info("constructionerp document versions", "changed", n)
+			}
+			if n, err := poster.DrainDocs(ctx); err != nil {
+				slog.Error("book documents in erpnext", "err", err)
+			} else if n > 0 {
+				slog.Info("documents reconciled", "count", n)
 			}
 			select {
 			case <-ctx.Done():

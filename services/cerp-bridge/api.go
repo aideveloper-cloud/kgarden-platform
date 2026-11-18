@@ -17,6 +17,8 @@ func (a *API) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	mux.HandleFunc("GET /purchase-orders", a.list)
 	mux.HandleFunc("POST /purchase-orders/{id}/retry", a.retry)
+	mux.HandleFunc("GET /documents", a.documents)
+	mux.HandleFunc("POST /documents/{kind}/{id}/retry", a.retryDocument)
 	return mux
 }
 
@@ -65,6 +67,52 @@ func (a *API) retry(w http.ResponseWriter, r *http.Request) {
 	}
 	if n == 0 {
 		writeJSON(w, 409, map[string]string{"error": "no dead purchase order with this id"})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "pending"})
+}
+
+// documents lists receipts, invoices and payments: what ConstructionERP has, what ERPNext holds.
+func (a *API) documents(w http.ResponseWriter, r *http.Request) {
+	var out []map[string]any
+	err := a.store.Tx(r.Context(), func(tx pgx.Tx) error {
+		rows, err := tx.Query(r.Context(), `SELECT kind, cerp_id::text AS id, ref, cerp_status, live,
+			coalesce(erpnext_doc, '') AS erpnext_doc, sync_status, attempts, last_error, synced_at
+			FROM cerp_bridge.doc_state
+			WHERE ($1 = '' OR kind = $1) AND ($2 = '' OR sync_status = $2)
+			ORDER BY cerp_updated_at DESC LIMIT 300`, r.URL.Query().Get("kind"), r.URL.Query().Get("status"))
+		if err != nil {
+			return err
+		}
+		out, err = pgx.CollectRows(rows, pgx.RowToMap)
+		return err
+	})
+	if err != nil {
+		slog.Error("documents", "err", err)
+		writeJSON(w, 500, map[string]string{"error": "internal error"})
+		return
+	}
+	if out == nil {
+		out = []map[string]any{}
+	}
+	writeJSON(w, 200, map[string]any{"data": out})
+}
+
+func (a *API) retryDocument(w http.ResponseWriter, r *http.Request) {
+	var n int64
+	err := a.store.Tx(r.Context(), func(tx pgx.Tx) error {
+		tag, err := tx.Exec(r.Context(), `UPDATE cerp_bridge.doc_state SET sync_status = 'pending', attempts = 0, next_attempt_at = now()
+			WHERE kind = $1 AND cerp_id::text = $2 AND sync_status = 'dead'`, r.PathValue("kind"), r.PathValue("id"))
+		n = tag.RowsAffected()
+		return err
+	})
+	if err != nil {
+		slog.Error("retry document", "err", err)
+		writeJSON(w, 500, map[string]string{"error": "internal error"})
+		return
+	}
+	if n == 0 {
+		writeJSON(w, 409, map[string]string{"error": "no dead document with this kind and id"})
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "pending"})
