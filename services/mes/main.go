@@ -1,7 +1,7 @@
 // Command mes is the K Garden production shop-floor service (MES).
 //
 //	mes migrate   apply database migrations (uses MES_DB_OWNER_URL)
-//	mes serve     run the HTTP API, Work Order sync and outbox worker (uses MES_DB_URL)
+//	mes serve     run the HTTP API, Work Order sync (every MES_WORK_ORDER_SYNC, default 15s) and outbox worker (uses MES_DB_URL)
 package main
 
 import (
@@ -72,7 +72,8 @@ func serve(ctx context.Context) error {
 	}
 	go worker.Loop(ctx, 2*time.Second)
 	go func() {
-		t := time.NewTicker(60 * time.Second)
+		// New and changed Work Orders reach the tablets within this interval.
+		t := time.NewTicker(durationEnv("MES_WORK_ORDER_SYNC", 15*time.Second))
 		defer t.Stop()
 		for {
 			select {
