@@ -25,7 +25,7 @@ check() {
 	if [[ "$2" == "$3" ]]; then echo "  PASS  $1 ($2)"; pass=$((pass + 1)); else echo "  FAIL  $1: got '$2', expected '$3'"; exit 1; fi
 }
 TOKEN=$(curl -sS -X POST "$CERP/api/v1/users/auth/demo-login/" -H 'Content-Type: application/json' \
-	-d '{"email":"demo@openconstructionerp.com"}' | jq -r .access_token)
+	-d "{\"email\":\"${CERP_E2E_DEMO_EMAIL:-manager@openconstructionerp.com}\"}" | jq -r .access_token)
 cerp() { curl -sS -X "$1" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' "$CERP/api/v1$2" ${3:+--data "$3"}; }
 erp() { curl -sS -H "$AUTH" "$ERP$1"; }
 must() { # description json-with-maybe-detail field

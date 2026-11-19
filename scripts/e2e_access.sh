@@ -37,8 +37,14 @@ authorize() { # jar client -> prints "<http status> <code or ->"
 	loc=${r#* }
 	if [[ "$loc" == *"code="* ]]; then echo "${r%% *} $(sed -E 's/.*[?&]code=([^&]+).*/\1/' <<<"$loc")"; else echo "${r%% *} -"; fi
 }
-token() { # client code -> access token
-	curl -sS -u "$1:$(secret "$1")" -X POST "$ERP/api/method/frappe.integrations.oauth2.get_token" \
+token() { # client code -> access token (in the header or the body, as the client is set up)
+	local sec auth; sec=$(secret "$1")
+	if [[ $(as admin GET "/api/resource/OAuth%20Client/$1" | jq -r .data.token_endpoint_auth_method) == "Client Secret Post" ]]; then
+		auth=(--data-urlencode "client_secret=$sec")
+	else
+		auth=(-u "$1:$sec")
+	fi
+	curl -sS "${auth[@]}" -X POST "$ERP/api/method/frappe.integrations.oauth2.get_token" \
 		--data-urlencode grant_type=authorization_code --data-urlencode "code=$2" \
 		--data-urlencode "redirect_uri=$(redirect_of "$1")" --data-urlencode "client_id=$1" | jq -r .access_token
 }
