@@ -35,7 +35,10 @@
 		whenSignedOut(() => (me = null));
 		auth
 			.me()
-			.then((m) => (me = m))
+			.then((m) => {
+				me = m;
+				refresh(); // signed in already (or back from ERPNext): show the work orders at once
+			})
 			.catch(() => (me = null))
 			.finally(() => (checking = false));
 		const t = setInterval(() => me && refresh(), 3000);
@@ -88,6 +91,10 @@
 		resetForm();
 		detail = null;
 		await refresh();
+		// Narrow screens stack the report under the list: bring it into view.
+		if (!matchMedia('(min-width: 768px)').matches) {
+			document.getElementById('report')?.scrollIntoView({ block: 'start' });
+		}
 	}
 
 	async function run(fn: () => Promise<unknown>, okText: string) {
@@ -205,9 +212,9 @@
 			</section>
 
 			<!-- Selected work order -->
-			<section class="rounded-2xl bg-white p-4 shadow-sm" aria-label="รายงานผล">
+			<section id="report" class="scroll-mt-4 rounded-2xl bg-white p-4 shadow-sm" aria-label="รายงานผล">
 				{#if !current}
-					<p class="py-16 text-center text-stone-500">เลือกใบสั่งผลิตทางซ้าย</p>
+					<p class="py-16 text-center text-stone-500">เลือกใบสั่งผลิตจากรายการ</p>
 				{:else}
 					<div class="flex flex-wrap items-center justify-between gap-3">
 						<div>
