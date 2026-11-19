@@ -23,8 +23,13 @@ pass=0
 erp() { # method path [json]
 	curl -sS -X "$1" -H "$AUTH" -H "Content-Type: application/json" "$ERP$2" ${3:+--data "$3"}
 }
+# The MES needs a session: sign in as the test supervisor (employee code + PIN managed in ERPNext).
+JAR=$(mktemp); trap 'rm -f "$JAR"' EXIT
+curl -sS -c "$JAR" -X POST "$MES/auth/pin" -H 'Content-Type: application/json' \
+	--data "$(jq -cn --arg c "${MES_E2E_SUPERVISOR:?}" --arg p "${MES_E2E_SUPERVISOR_PIN:?}" '{employee_code:$c, pin:$p}')" | jq -e .role >/dev/null \
+	|| { echo "MES sign-in failed"; exit 1; }
 mes() { # method path [json] [idempotency-key]
-	curl -sS -X "$1" -H "Content-Type: application/json" ${4:+-H "Idempotency-Key: $4"} "$MES$2" ${3:+--data "$3"} -w '\n%{http_code}'
+	curl -sS -b "$JAR" -X "$1" -H "Content-Type: application/json" ${4:+-H "Idempotency-Key: $4"} "$MES$2" ${3:+--data "$3"} -w '\n%{http_code}'
 }
 bin_qty() { # item warehouse
 	local f

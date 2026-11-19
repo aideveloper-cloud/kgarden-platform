@@ -263,3 +263,71 @@ func IsNegativeStock(err error) bool {
 	var ee *Error
 	return errors.As(err, &ee) && ee.ExcType == "NegativeStockError"
 }
+
+// Update changes fields of an existing document and returns it.
+func (c *Client) Update(ctx context.Context, doctype, name string, fields map[string]any) (map[string]any, error) {
+	var out struct {
+		Data map[string]any `json:"data"`
+	}
+	err := c.do(ctx, http.MethodPut, "/api/resource/"+url.PathEscape(doctype)+"/"+url.PathEscape(name), nil, fields, &out)
+	return out.Data, err
+}
+
+// Cancel cancels a submitted document (docstatus 1 -> 2).
+func (c *Client) Cancel(ctx context.Context, doctype, name string) error {
+	return c.do(ctx, http.MethodPost, "/api/method/frappe.client.cancel", nil,
+		map[string]any{"doctype": doctype, "name": name}, nil)
+}
+
+// FindByField returns the name and docstatus of the first document whose field equals value.
+func (c *Client) FindByField(ctx context.Context, doctype, field, value string) (name string, docstatus int, err error) {
+	rows, err := c.List(ctx, doctype, []string{"name", "docstatus"}, [][]any{{field, "=", value}}, 1)
+	if err != nil || len(rows) == 0 {
+		return "", 0, err
+	}
+	ds, _ := rows[0]["docstatus"].(float64)
+	return rows[0]["name"].(string), int(ds), nil
+}
+
+// CallMethod calls a whitelisted ERPNext method (POST) and returns its message as a document,
+// e.g. a mapper such as make_purchase_receipt that builds an unsaved document from another.
+func (c *Client) CallMethod(ctx context.Context, method string, args map[string]any) (map[string]any, error) {
+	var out struct {
+		Message map[string]any `json:"message"`
+	}
+	err := c.do(ctx, http.MethodPost, "/api/method/"+method, nil, args, &out)
+	return out.Message, err
+}
+
+// CleanDoc drops client-side bookkeeping keys (__islocal, unsaved names) from a mapped document.
+func CleanDoc(v any) any { return cleanDoc(v) }
+
+// Delete removes a document; used only for drafts the integration itself left behind.
+func (c *Client) Delete(ctx context.Context, doctype, name string) error {
+	return c.do(ctx, http.MethodDelete, "/api/resource/"+url.PathEscape(doctype)+"/"+url.PathEscape(name), nil, nil, nil)
+}
+
+// GetMethod calls a whitelisted GET method and decodes its message into out.
+func (c *Client) GetMethod(ctx context.Context, method string, query url.Values, out any) error {
+	var wrap struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := c.do(ctx, http.MethodGet, "/api/method/"+method, query, nil, &wrap); err != nil {
+		return err
+	}
+	return json.Unmarshal(wrap.Message, out)
+}
+
+// PostMethod calls a whitelisted POST method and decodes its message into out.
+func (c *Client) PostMethod(ctx context.Context, method string, args map[string]any, out any) error {
+	var wrap struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := c.do(ctx, http.MethodPost, "/api/method/"+method, nil, args, &wrap); err != nil {
+		return err
+	}
+	return json.Unmarshal(wrap.Message, out)
+}
+
+// Base is the ERPNext URL the client talks to.
+func (c *Client) Base() string { return c.base }

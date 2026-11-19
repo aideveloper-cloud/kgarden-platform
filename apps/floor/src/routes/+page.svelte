@@ -1,12 +1,16 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Keypad from '#lib/Keypad.svelte';
-	import { fmt, mes, MesError, type WorkOrder, type WorkOrderDetail } from '#lib/mes.js';
+	import SignIn from '#lib/SignIn.svelte';
+	import { auth, fmt, mes, MesError, whenSignedOut, type Me, type WorkOrder, type WorkOrderDetail } from '#lib/mes.js';
 
 	const SCRAP_REASONS = ['ไม้แตก', 'สีไม่สม่ำเสมอ', 'ขนาดไม่ได้', 'วัสดุเสีย'];
 
-	let operator = $state('');
-	let operatorDraft = $state('');
+	// Who is signed in (from ERPNext-managed access); null = show the sign-in screen.
+	let me = $state<Me | null>(null);
+	let checking = $state(true);
+	// Shared tablet: sign out after this long without a touch.
+	const IDLE_MS = 10 * 60 * 1000;
 	let orders = $state<WorkOrder[]>([]);
 	let selected = $state<string | null>(null);
 	let detail = $state<WorkOrderDetail | null>(null);
@@ -28,13 +32,32 @@
 	);
 
 	onMount(() => {
-		try {
-			operator = localStorage.getItem('kg.operator') ?? '';
-		} catch {}
-		refresh();
-		const t = setInterval(refresh, 3000);
-		return () => clearInterval(t);
+		whenSignedOut(() => (me = null));
+		auth
+			.me()
+			.then((m) => (me = m))
+			.catch(() => (me = null))
+			.finally(() => (checking = false));
+		const t = setInterval(() => me && refresh(), 3000);
+		let idle = setTimeout(signOut, IDLE_MS);
+		const touch = () => {
+			clearTimeout(idle);
+			idle = setTimeout(() => me && signOut(), IDLE_MS);
+		};
+		for (const ev of ['pointerdown', 'keydown']) window.addEventListener(ev, touch);
+		return () => {
+			clearInterval(t);
+			clearTimeout(idle);
+			for (const ev of ['pointerdown', 'keydown']) window.removeEventListener(ev, touch);
+		};
 	});
+
+	async function signOut() {
+		await auth.logout().catch(() => {});
+		me = null;
+		selected = null;
+		detail = null;
+	}
 
 	async function refresh() {
 		try {
@@ -49,13 +72,6 @@
 	function say(kind: 'ok' | 'err', text: string) {
 		toast = { kind, text };
 		setTimeout(() => (toast = null), 4000);
-	}
-
-	function saveOperator() {
-		operator = operatorDraft.trim();
-		try {
-			localStorage.setItem('kg.operator', operator);
-		} catch {}
 	}
 
 	function resetForm() {
@@ -95,8 +111,7 @@
 			const r = await mes.output(current.name, pendingKey, {
 				good_qty: good,
 				scrap_qty: scrap,
-				scrap_reason: scrapReason,
-				operator
+				scrap_reason: scrapReason
 			});
 			say('ok', r.replayed ? 'บันทึกไว้แล้วก่อนหน้านี้ (ไม่นับซ้ำ)' : `บันทึกแล้ว ดี ${fmt(good)} เสีย ${fmt(scrap)}`);
 			resetForm();
@@ -114,6 +129,7 @@
 		}
 	}
 
+	const roleText: Record<string, string> = { operator: 'ผู้ปฏิบัติงาน', supervisor: 'หัวหน้างาน', superadmin: 'ผู้ดูแลระบบ' };
 	const statusText = { pending: 'รอส่ง ERP', posted: 'ส่งแล้ว', failed: 'ส่งไม่สำเร็จ' } as const;
 	const statusClass = {
 		pending: 'bg-amber-100 text-amber-800',
@@ -123,36 +139,29 @@
 	const time = (s: string) => new Date(s).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
 </script>
 
-{#if !operator}
-	<main class="flex min-h-dvh items-center justify-center p-4">
-		<form
-			class="w-full max-w-sm space-y-4 rounded-2xl bg-white p-6 shadow"
-			onsubmit={(e) => {
-				e.preventDefault();
-				saveOperator();
-			}}
-		>
-			<h1 class="text-2xl font-bold text-brand-700">K Garden · หน้างานผลิต</h1>
-			<label class="block space-y-1">
-				<span class="text-stone-600">ชื่อผู้ปฏิบัติงาน</span>
-				<input bind:value={operatorDraft} class="h-14 w-full rounded-xl border border-stone-300 px-4 text-xl" autocomplete="off" />
-			</label>
-			<button disabled={!operatorDraft.trim()} class="h-14 w-full rounded-xl bg-brand-600 text-xl font-semibold text-white disabled:opacity-40">
-				เริ่มงาน
-			</button>
-		</form>
-	</main>
+{#if checking}
+	<main class="flex min-h-dvh items-center justify-center text-stone-500">กำลังโหลด…</main>
+{:else if !me}
+	<SignIn
+		onSignedIn={(m) => {
+			me = m;
+			refresh();
+		}}
+	/>
 {:else}
 	<div class="flex min-h-dvh flex-col">
 		<header class="flex items-center justify-between gap-3 bg-brand-700 px-4 py-3 text-white">
 			<h1 class="text-lg font-bold">K Garden · หน้างานผลิต</h1>
 			<div class="flex items-center gap-2">
-				<button class="rounded-lg bg-white/15 px-3 py-2" onclick={() => run(() => mes.sync(), 'ดึงใบสั่งผลิตล่าสุดแล้ว')} disabled={busy}>
-					รีเฟรช
-				</button>
-				<button class="rounded-lg bg-white/15 px-3 py-2" onclick={() => ((operatorDraft = operator), (operator = ''))}>
-					👤 {operator}
-				</button>
+				{#if me.role !== 'operator'}
+					<button class="rounded-lg bg-white/15 px-3 py-2" onclick={() => run(() => mes.sync(), 'ดึงใบสั่งผลิตล่าสุดแล้ว')} disabled={busy}>
+						รีเฟรช
+					</button>
+				{/if}
+				<span class="rounded-lg bg-white/15 px-3 py-2" data-testid="signed-in">
+					👤 {me.full_name}{me.employee_code ? ` (${me.employee_code})` : ''} · {roleText[me.role] ?? me.role}
+				</span>
+				<button class="rounded-lg bg-white px-3 py-2 font-semibold text-brand-700" onclick={signOut}>ออกจากระบบ</button>
 			</div>
 		</header>
 
@@ -208,13 +217,13 @@
 						{#if current.running}
 							<button
 								disabled={busy}
-								onclick={() => run(() => mes.stop(current!.name, operator), 'หยุดงานแล้ว')}
+								onclick={() => run(() => mes.stop(current!.name), 'หยุดงานแล้ว')}
 								class="h-14 rounded-xl bg-stone-800 px-6 text-lg font-semibold text-white disabled:opacity-40">■ หยุดงาน</button
 							>
 						{:else}
 							<button
 								disabled={busy}
-								onclick={() => run(() => mes.start(current!.name, operator), 'เริ่มงานแล้ว')}
+								onclick={() => run(() => mes.start(current!.name), 'เริ่มงานแล้ว')}
 								class="h-14 rounded-xl bg-brand-600 px-6 text-lg font-semibold text-white disabled:opacity-40">▶ เริ่มงาน</button
 							>
 						{/if}

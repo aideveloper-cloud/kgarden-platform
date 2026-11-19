@@ -86,9 +86,23 @@ func serve(ctx context.Context) error {
 		}
 	}()
 
+	// Sign-in and access come from ERPNext (MES_FLOOR app); the service account only checks access.
+	auth := &Auth{
+		store:  store,
+		access: erpnext.New(mustEnv("ERPNEXT_URL"), mustEnv("MES_ACCESS_API_KEY"), mustEnv("MES_ACCESS_API_SECRET")),
+		oidc: OIDCConfig{
+			ClientID:     mustEnv("MES_OIDC_CLIENT_ID"),
+			ClientSecret: mustEnv("MES_OIDC_CLIENT_SECRET"),
+			RedirectURI:  mustEnv("MES_OIDC_REDIRECT_URI"),
+		},
+		ttl:  durationEnv("MES_SESSION_TTL", 12*time.Hour),
+		http: &http.Client{Timeout: 15 * time.Second},
+	}
+	go auth.WatchAccess(ctx, durationEnv("MES_ACCESS_POLL", time.Minute))
+
 	srv := &http.Server{
 		Addr:              mustEnv("MES_HTTP_ADDR"),
-		Handler:           (&API{store: store, sync: syncer}).Routes(),
+		Handler:           (&API{store: store, sync: syncer, auth: auth}).Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
@@ -102,4 +116,15 @@ func serve(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func durationEnv(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		fmt.Fprintf(os.Stderr, "%s: not a duration (e.g. 12h, 30s): %q\n", key, v)
+		os.Exit(2)
+	}
+	return def
 }

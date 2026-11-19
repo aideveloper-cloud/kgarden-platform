@@ -7,6 +7,7 @@ talk to ERPNext through its REST API.
 ```
 services/mes/         Production shop-floor service (Go): Work Order sync, start/stop, output, outbox to ERPNext
 services/wms-bridge/  Copies the WMS (production-pos) stock ledger into ERPNext as Stock Entries (Go)
+services/cerp-bridge/ Books ConstructionERP purchase orders in ERPNext, company KGF Construction (Go)
 internal/             Shared Go packages: ERPNext REST client, PostgreSQL store and migrations
 apps/floor/     Shop-floor tablet screen (SvelteKit, Bun, Tailwind) on top of the MES API
 scripts/        End-to-end tests against a running ERPNext + services
@@ -34,6 +35,53 @@ Scrap is recorded in `mes.scrap_log` only; posting it to ERPNext is not done yet
 | POST | `/work-orders/{name}/output` | `{"good_qty": 4, "scrap_qty": 0, "scrap_reason": "", "operator": "..."}` + `Idempotency-Key` header |
 | POST | `/sync/work-orders` | pull Work Orders from ERPNext now |
 | GET | `/outbox?status=pending\|sent\|dead` | outbox state, errors |
+
+## App access, managed in ERPNext (`kgarden` app, `kgarden.access`)
+
+People and their access to every K Garden app are managed in one place: the User form in ERPNext
+(Roles & Permissions tab, "K Garden: สิทธิ์เข้าใช้แอป"). Decided 2026-11-18.
+
+- **KG App** lists the apps (ERPNEXT desk, WMS, CERP, MES_FLOOR) with their roles and scope
+  (WMS: Warehouse, CERP: Project). Each app has an access role `KG App: <code>`.
+- A user's table **แอปที่เข้าใช้ได้** grants app + role (+ scope). Not in the table = cannot use the app.
+  **ผู้ดูแลระบบสูงสุด** (`KG Super Admin`) opens every app as admin. Only a super admin may change
+  these fields; everything is logged in the user's activity.
+- Saving the user syncs Frappe roles: the access role of each granted app, the ERPNext roles of the
+  desk app's role (no desk app = Website User, no desk), KG Super Admin + System Manager for a super admin.
+- **Sign-in (OpenID Connect):** each app has an OAuth Client in ERPNext allowing only its access role
+  and KG Super Admin, so ERPNext itself refuses to sign anyone else in (a Thai "ไม่มีสิทธิ์เข้าใช้" page).
+  The userinfo (`frappe.integrations.oauth2.openid_profile`) adds `kg_app`, `kg_role`, `kg_scopes`,
+  `kg_scope_doctype`, `kg_superadmin`, `kg_employee_code` for the app asking.
+- **Losing access** (row removed, user disabled) revokes that app's OAuth tokens at once; apps poll
+  `kgarden.access.api.access_changes` to end their own sessions.
+- **Shared floor tablets:** employee code + PIN (`set_pin` by a super admin, stored as a hash in
+  KG User PIN) checked by `kgarden.access.api.verify_pin` with the app's service account
+  (role `KG Access Service`); rate-limited per employee code.
+- Integration accounts (`integration@`, `cerp.integration@`) are not managed by this form.
+- **WMS (production-pos, branch `feat/kgarden-access`, `KGARDEN_ACCESS_ENABLED`)**: POS tablets unlock
+  with employee code + PIN at a chosen warehouse (verify_pin with the warehouse as scope, service account
+  `wms.access@example.com`), the cut/receipt operator is that person; the dashboard has
+  "เข้าสู่ระบบด้วย K Garden"; password login only for `KGARDEN_LOCAL_LOGIN` (break-glass);
+  `php artisan kgarden:sync-access` (every minute) strips rights and ends sessions of people who lost
+  WMS access. ERPNext role → WMS role: superadmin → super-admin, admin/supervisor → warehouse-admin,
+  operator → warehouse-pos; scopes (ERPNext warehouses) → user_outlets. While the flag is off the WMS
+  works exactly as before (warehouse PINs, local passwords).
+- **ConstructionERP (branch `feat/th-kgarden-access`, `KGARDEN_ACCESS_ENABLED` + its OIDC settings)**:
+  its existing OIDC sign-in now works with ERPNext (authorization endpoint from discovery, `state`,
+  client secret posted, empty `sub` falls back to the email) and fixes a returning-user refusal.
+  ERPNext role → local role: superadmin/admin → admin, project_manager/approver → manager,
+  accountant/purchaser → editor, viewer → viewer (`KGARDEN_ROLE_MAP` overrides). Project scope →
+  membership of a "K Garden access" team per project (no scope = every project); cerp-bridge copies
+  every ConstructionERP project into ERPNext so any project can be granted. Password login only for
+  `KGARDEN_LOCAL_LOGIN`. A poller (`KGARDEN_ACCESS_POLL_SECONDS`) ends sessions on lost access or a new
+  role (`password_changed_at`).
+
+```bash
+ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_access.sh     # 25 checks through the real sign-in flow (local site only)
+ERPNEXT_ADMIN_PASSWORD=... scripts/e2e_mes_auth.sh   # 16 checks: MES PIN + ERPNext sign-in, revocation, roles
+ERPNEXT_ADMIN_PASSWORD=... WMS_URL=http://127.0.0.1:8300 WMS_APP_DIR=... scripts/e2e_wms_auth.sh   # 14 checks
+ERPNEXT_ADMIN_PASSWORD=... CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_auth.sh   # 11 checks
+```
 
 ## WMS bridge (`services/wms-bridge`)
 
@@ -83,9 +131,68 @@ the bridge does the same when the WMS receives finished goods before the MES rep
 
 The ERPNext integration user needs Stock User + Stock Manager + Item Manager (for masters).
 
+## ConstructionERP bridge (`services/cerp-bridge`)
+
+Decided 2026-11-18: **ConstructionERP buys, ERPNext books**, and the construction business is its own
+company in ERPNext (`KGF Construction`, abbr KGFC, set up by `kgarden.construction.setup.ensure`).
+ConstructionERP keeps PR → PO → approval (Thai numbering, VAT, WHT, budget check); ERPNext owns
+suppliers, projects, accounts, VAT and AP. The bridge reads ConstructionERP with a read-only role
+(`cerp_bridge`) and uses its own ERPNext user `cerp.integration@example.com`.
+
+| ConstructionERP | ERPNext |
+|---|---|
+| contact (vendor) | Supplier, matched by `kg_cerp_id`, else adopted by tax ID, else created |
+| project | Project (`kg_cerp_id`) in KGF Construction |
+| PO approved / issued / partially received / completed | one submitted Purchase Order (`kg_cerp_po_number`, `kg_idempotency_key`) |
+| PO line `cost_category` | non-stock item CON-MATERIAL / LABOR / SUBCONTRACT / EQUIPMENT / OTHER; text, unit, qty, rate kept |
+| `vat_mode` exclusive / inclusive / none | VAT row on `CERP_BRIDGE_VAT_ACCOUNT` (inclusive = included in rate) / none |
+| WHT (type, rate, amount) | written in the PO terms; booked later on the purchase invoice / payment |
+
+- Every PO version (content hash) gets its own key `cerp-po-<id>-<hash>`. An approved PO sent back
+  to draft and edited, then approved again, cancels the old ERPNext PO and books a new one; draft or
+  cancelled leaves no submitted ERPNext PO. Issuing or receiving does not create a new version.
+- A PO is submitted only if ERPNext's grand total equals ConstructionERP's `amount_total`; otherwise it
+  stays a draft with the difference in `last_error`.
+- Polls `updated_at` every 5 s with a 5-minute look-back; failures back off and go `dead` after 10.
+- API: `GET /purchase-orders?status=pending|synced|dead`, `POST /purchase-orders/{id}/retry`.
+
+Receipts, invoices and payments (`cerp_bridge.doc_state`, posted after the POs they depend on):
+
+| ConstructionERP | ERPNext |
+|---|---|
+| goods receipt `confirmed` | Purchase Receipt from the booked PO (mapper), accepted qty = received − rejected |
+| payable invoice `approved`/`sent`/`paid` | Purchase Invoice: from the PO when linked (lines matched by text + rate), else on its own with VAT as an exact amount; submitted only if the total matches |
+| payment on a payable invoice | Payment Entry: cash from the company cash account, Thai WHT as a deduction on `CERP_BRIDGE_WHT_ACCOUNT` (ภาษีหัก ณ ที่จ่ายค้างจ่าย), type / rate / certificate no. kept for ภ.ง.ด.3/53 |
+
+- WHT is recorded on the payment in ConstructionERP (`wht_type`, `wht_rate`, `wht_amount`,
+  `wht_certificate_no`, its "mark paid" dialog), decided 2026-11-18; cash + WHT settle the invoice.
+- A cancelled invoice cancels its Purchase Invoice (ERPNext refuses while payments exist: that needs a person).
+- Receipts and payments dated in the future wait until that day (ERPNext refuses future-dated documents).
+- Not booked yet: invoices with retention, supplier refunds, credit notes.
+- API: `GET /documents?kind=receipt|invoice|payment&status=...`, `POST /documents/{kind}/{id}/retry`.
+
+### Signing in to the MES (`services/mes/auth.go`)
+
+Who may use the floor tablet, and as what, is set in ERPNext (app MES_FLOOR: operator, supervisor;
+super admins and Administrator get every app). Two ways in, both decided by ERPNext:
+
+- **Employee code + PIN** on a shared tablet: `POST /auth/pin`, checked by
+  `kgarden.access.api.verify_pin` with the MES service account (`MES_ACCESS_API_KEY/SECRET`, role
+  KG Access Service only).
+- **"เข้าสู่ระบบด้วย K Garden"**: OpenID Connect against ERPNext (`GET /auth/oidc/start`, ERPNext sign-in
+  page, back to the tablet's `/auth/callback`, `POST /auth/oidc/callback`; the code is exchanged server
+  side with `MES_OIDC_CLIENT_ID/SECRET`; the state is single use).
+
+The MES then issues its own session (HttpOnly cookie, stored hashed in `mes.session`, `MES_SESSION_TTL`,
+default 12h). Every API call except `/healthz` and `/auth/*` needs it; operators and supervisors work
+the floor, only supervisors pull Work Orders and read the outbox. The operator of every action is the
+signed-in person ("ชื่อ (รหัสพนักงาน)"), never a name sent in the request. Sessions end on logout, after
+10 minutes without a touch on the tablet, or within `MES_ACCESS_POLL` (default 1m) when ERPNext reports
+the person lost MES access or got another role.
+
 ### Tablet screen (`apps/floor`)
 
-Operator signs in by name, picks an open Work Order, starts/stops the job and reports good and scrap
+Operator signs in (employee code + PIN, or through ERPNext), picks an open Work Order, starts/stops the job and reports good and scrap
 quantity on a large keypad (scrap needs a reason). Each report carries an `Idempotency-Key`; if the send
 fails on the network or a 5xx, the values are locked and "ส่งซ้ำ" resends the same key, so a retry is never
 counted twice. The screen refreshes every 3 s and shows whether each report has reached ERPNext.
@@ -110,6 +217,10 @@ go build -o bin/ ./services/...
 scripts/e2e_production.sh
 WMS_APP_DIR=~/Desktop/production-pos/point-of-sales scripts/e2e_wms_bridge.sh   # local WMS copy only
 WMS_APP_DIR=~/Desktop/production-pos/point-of-sales scripts/e2e_wip_flow.sh      # WMS → WIP → MES → WMS
+./bin/cerp-bridge migrate && ./bin/cerp-bridge serve
+CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_bridge.sh                       # local ConstructionERP only
+CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_ap.sh                           # receipt → invoice → payment with WHT
+scripts/reconcile.sh   # read-only: does ERPNext hold exactly what WMS, ConstructionERP and MES say happened?
 ```
 
 Local WMS copy: MySQL container `kgarden-wms-mysql` on 127.0.0.1:13306 (the WMS `.env` points there),
