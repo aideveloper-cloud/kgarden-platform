@@ -60,6 +60,22 @@ type Worker struct {
 	erp         *erpnext.Client
 	sync        *Syncer
 	maxAttempts int
+	// materialWait is how often an output waiting for raw material in WIP is tried again. It is
+	// waiting, not failing, so it does not back off: the output posts soon after the WMS moves the
+	// material in.
+	materialWait time.Duration
+}
+
+// retryDelay is when a failed event is tried again: on a short fixed interval while the raw
+// material is not in WIP yet, otherwise exponential backoff (2s, 4s, 8s, ... up to 5 minutes).
+func retryDelay(attempts int, err error, materialWait time.Duration) time.Duration {
+	if erpnext.IsNegativeStock(err) {
+		if materialWait <= 0 {
+			materialWait = 10 * time.Second
+		}
+		return materialWait
+	}
+	return time.Duration(math.Min(math.Pow(2, float64(attempts)), 300)) * time.Second
 }
 
 func (w *Worker) Loop(ctx context.Context, every time.Duration) {
@@ -128,7 +144,14 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 		}
 
 		attempts := ev.Attempts + 1
-		slog.Warn("outbox event failed", "id", ev.ID, "type", ev.Type, "attempt", attempts, "err", err)
+		if erpnext.IsNegativeStock(err) {
+			// Expected while the WMS has not cut the material yet: say so once, then every 30 tries.
+			if attempts == 1 || attempts%30 == 0 {
+				slog.Info("output waiting for raw material in WIP", "id", ev.ID, "attempt", attempts, "output_id", ev.Payload["output_id"])
+			}
+		} else {
+			slog.Warn("outbox event failed", "id", ev.ID, "type", ev.Type, "attempt", attempts, "err", err)
+		}
 		// Raw material not in WIP yet (the WMS has not moved it): wait for it instead of failing the output.
 		if attempts >= w.maxAttempts && !erpnext.IsNegativeStock(err) {
 			if _, uerr := tx.Exec(ctx, `UPDATE mes.outbox_event SET status = 'dead', attempts = $2, last_error = $3 WHERE id = $1`,
@@ -138,7 +161,7 @@ func (w *Worker) processOne(ctx context.Context) (bool, error) {
 			_, uerr := tx.Exec(ctx, `UPDATE mes.production_output SET status = 'failed' WHERE id = $1::uuid`, ev.Payload["output_id"])
 			return uerr
 		}
-		backoff := time.Duration(math.Min(math.Pow(2, float64(attempts)), 300)) * time.Second
+		backoff := retryDelay(attempts, err, w.materialWait)
 		_, uerr := tx.Exec(ctx, `UPDATE mes.outbox_event SET attempts = $2, last_error = $3, next_attempt_at = now() + $4::interval
 			WHERE id = $1`, ev.ID, attempts, err.Error(), fmt.Sprintf("%d seconds", int(backoff.Seconds())))
 		return uerr
