@@ -135,4 +135,10 @@ check "super admin signs in to ConstructionERP" "$st" 302
 check "as superadmin" "$(userinfo "$(token "$CERP" "$code")" | jq -r .kg_role)" superadmin
 check "and has the ERPNext desk" "$(as admin GET "/api/resource/User/$B" | jq -r .data.user_type)" "System User"
 
+echo "9. Tablet PINs are set from the User form by a super admin"
+check "PIN status shows it is set" "$(as admin GET "/api/method/kgarden.access.api.pin_status?user=$(jq -rn --arg u "$A" '$u|@uri')" | jq -c '.message|[.pin_set, (.set_on|length>0), .set_by]')" '[true,true,"Administrator"]'
+check "never the PIN or its hash" "$(as admin GET "/api/method/kgarden.access.api.pin_status?user=$(jq -rn --arg u "$A" '$u|@uri')" | jq -c '.message|keys')" '["pin_set","set_by","set_on","user"]'
+check "no PIN without an employee code" "$(as admin POST /api/method/kgarden.access.api.set_pin "$(jq -cn --arg u "$C" '{user:$u, pin:"1234"}')" | jq -r .exc_type)" ValidationError
+check "only a super admin sees PIN status" "$(as c GET "/api/method/kgarden.access.api.pin_status?user=$(jq -rn --arg u "$A" '$u|@uri')" | jq -r .exc_type)" PermissionError
+
 echo "ALL $pass CHECKS PASSED"
