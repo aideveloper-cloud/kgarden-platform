@@ -63,7 +63,8 @@ func serve(ctx context.Context) error {
 	store := pgstore.New(pool, mustEnv("MES_ORG_ID"))
 	erp := erpnext.New(mustEnv("ERPNEXT_URL"), mustEnv("ERPNEXT_API_KEY"), mustEnv("ERPNEXT_API_SECRET"))
 	syncer := &Syncer{store: store, erp: erp}
-	worker := &Worker{store: store, erp: erp, sync: syncer, maxAttempts: 8}
+	worker := &Worker{store: store, erp: erp, sync: syncer, maxAttempts: 8,
+		materialWait: durationEnv("MES_MATERIAL_RETRY", 10*time.Second)}
 
 	if n, err := syncer.Run(ctx); err != nil {
 		slog.Warn("initial work order sync failed", "err", err)
