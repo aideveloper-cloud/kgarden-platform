@@ -127,7 +127,7 @@ check "taken away: role removed" "$(jq -r '[.data.roles[].role] | index("Account
 check "and no desk again" "$(jq -r .data.user_type <<<"$u")" "Website User"
 
 echo "8. A super admin opens every app as admin"
-as admin POST /api/resource/User "$(jq -cn --arg e "$B" '{email:$e, first_name:"ผู้ดูแลสูงสุด ทดสอบ", send_welcome_email:0, kg_superadmin:1}')" >/dev/null
+as admin POST /api/resource/User "$(jq -cn --arg e "$B" '{email:$e, first_name:"ผู้ดูแลสูงสุด ทดสอบ", send_welcome_email:0, kg_superadmin:1, kg_employee_code:("SA" + ($e | split(".")[2] | split("@")[0]))}')" >/dev/null
 set_password "$B" "$PW_B"
 [[ $(login b "$B" "$PW_B") != "" ]]
 read -r st code <<<"$(authorize b "$CERP")"
@@ -140,5 +140,13 @@ check "PIN status shows it is set" "$(as admin GET "/api/method/kgarden.access.a
 check "never the PIN or its hash" "$(as admin GET "/api/method/kgarden.access.api.pin_status?user=$(jq -rn --arg u "$A" '$u|@uri')" | jq -c '.message|keys')" '["pin_set","set_by","set_on","user"]'
 check "no PIN without an employee code" "$(as admin POST /api/method/kgarden.access.api.set_pin "$(jq -cn --arg u "$C" '{user:$u, pin:"1234"}')" | jq -r .exc_type)" ValidationError
 check "only a super admin sees PIN status" "$(as c GET "/api/method/kgarden.access.api.pin_status?user=$(jq -rn --arg u "$A" '$u|@uri')" | jq -r .exc_type)" PermissionError
+
+echo "10. Everyone signs in with their employee code and password"
+check "sign in with the employee code" "$(login code "E2E$RUN" "$PW_A")" "No App"
+check "wrong password refused" "$(login bad "E2E$RUN" "wrong-$RUN")" "Invalid login credentials"
+check "the code is the login name" "$(as admin GET "/api/resource/User/$A" | jq -r .data.username)" "E2E$RUN"
+check "access without an employee code refused" "$(as admin POST /api/resource/User "$(jq -cn --arg e "e2e.nocode.$RUN@example.com" \
+	'{email:$e, first_name:"ไม่มีรหัส", send_welcome_email:0, kg_app_access:[{app:"MES_FLOOR", app_role:"operator"}]}')" | jq -r .exc_type)" ValidationError
+check "login page asks for the employee code" "$(curl -sS "$ERP/login" | grep -c 'รหัสพนักงาน</label>')" 1
 
 echo "ALL $pass CHECKS PASSED"
