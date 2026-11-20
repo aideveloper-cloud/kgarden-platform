@@ -44,10 +44,10 @@ P1=$(jq -r '.data[0].name' <<<"$projects"); P1_ID=$(jq -r '.data[0].kg_cerp_id' 
 P2=$(jq -r '.data[1].name' <<<"$projects"); P2_ID=$(jq -r '.data[1].kg_cerp_id' <<<"$projects")
 U="cerp.buyer.$RUN@example.com"; PW="Cerp-$RUN-x9"; NO="cerp.no.$RUN@example.com"
 grant() { erp PUT "/api/resource/User/$U" "$(jq -cn --argjson rows "$1" '{kg_app_access:$rows}')" >/dev/null; }
-erp POST /api/resource/User "$(jq -cn --arg e "$U" --arg p "$P1" '{email:$e, first_name:"จัดซื้อ ทดสอบ", send_welcome_email:0,
+erp POST /api/resource/User "$(jq -cn --arg e "$U" --arg p "$P1" '{email:$e, first_name:"จัดซื้อ ทดสอบ", send_welcome_email:0, kg_employee_code:("CB" + ($e | split(".")[2] | split("@")[0])),
 	kg_app_access:[{app:"CERP", app_role:"purchaser", scope_value:$p}]}')" >/dev/null
 erp PUT "/api/resource/User/$U" "$(jq -cn --arg p "$PW" '{new_password:$p}')" >/dev/null
-erp POST /api/resource/User "$(jq -cn --arg e "$NO" '{email:$e, first_name:"ไม่มีสิทธิ์ CERP", send_welcome_email:0,
+erp POST /api/resource/User "$(jq -cn --arg e "$NO" '{email:$e, first_name:"ไม่มีสิทธิ์ CERP", send_welcome_email:0, kg_employee_code:("CN" + ($e | split(".")[2] | split("@")[0])),
 	kg_app_access:[{app:"MES_FLOOR", app_role:"operator"}]}')" >/dev/null
 erp PUT "/api/resource/User/$NO" "$(jq -cn --arg p "$PW" '{new_password:$p}')" >/dev/null
 
