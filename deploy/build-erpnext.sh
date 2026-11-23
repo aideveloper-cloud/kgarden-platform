@@ -29,3 +29,8 @@ tag=$(date +%Y%m%d)-$(git -C "$ERPNEXT_SRC" rev-parse --short HEAD)-$(git -C "$K
 docker build --platform linux/arm64 -f "$ctx/Containerfile" --build-arg COMMITS="$commits" \
 	-t "kgarden/erpnext:$tag" -t kgarden/erpnext:latest "$ctx"
 echo "built kgarden/erpnext:$tag"
+# A build leaves tens of GB of BuildKit cache and the Colima disk is finite: keep the two newest
+# ERPNext images and drop the build cache (it rebuilds from the base images next time anyway).
+docker images kgarden/erpnext --format '{{.CreatedAt}}\t{{.Tag}}' | grep -v $'\tlatest$' | sort -r | tail -n +3 \
+	| cut -f2 | xargs -I{} docker rmi "kgarden/erpnext:{}" >/dev/null 2>&1 || true
+docker builder prune -af >/dev/null 2>&1 || true
