@@ -163,13 +163,19 @@ Receipts, invoices and payments (`cerp_bridge.doc_state`, posted after the POs t
 | goods receipt `confirmed` | Purchase Receipt from the booked PO (mapper), accepted qty = received − rejected |
 | payable invoice `approved`/`sent`/`paid` | Purchase Invoice: from the PO when linked (lines matched by text + rate), else on its own with VAT as an exact amount; submitted only if the total matches |
 | payment on a payable invoice | Payment Entry: cash from the company cash account, Thai WHT as a deduction on `CERP_BRIDGE_WHT_ACCOUNT` (ภาษีหัก ณ ที่จ่ายค้างจ่าย), type / rate / certificate no. kept for ภ.ง.ด.3/53 |
+| paid invoice → `credit_note_issued` | Debit Note: return of the whole Purchase Invoice (ERPNext keeps the balance on the Debit Note when the invoice was already paid) |
+| refund (`is_refund`) | Payment Entry, Receive from the supplier: against the Debit Note's balance, else unallocated (returns an overpayment) |
 
 - WHT is recorded on the payment in ConstructionERP (`wht_type`, `wht_rate`, `wht_amount`,
   `wht_certificate_no`, its "mark paid" dialog), decided 2026-11-18; cash + WHT settle the invoice.
 - A cancelled invoice cancels its Purchase Invoice (ERPNext refuses while payments exist: that needs a person).
 - Receipts and payments dated in the future wait until that day (ERPNext refuses future-dated documents).
-- Not booked yet: invoices with retention, supplier refunds, credit notes.
-- API: `GET /documents?kind=receipt|invoice|payment&status=...`, `POST /documents/{kind}/{id}/retry`.
+- Retention (เงินประกันผลงาน): the Purchase Invoice carries the gross and shows `kg_retention_amount`;
+  a payment settles only cash + WHT (retention held shows as `kg_retention_held`), so the retention
+  stays owed to the supplier on that invoice until a later payment releases it. ConstructionERP keeps
+  retention held only through `POST /finance/invoices/{id}/record-payment/` (`/finance/payments/` drops it).
+- A payment larger than what is outstanding leaves the extra unallocated, as an advance to the supplier.
+- API: `GET /documents?kind=receipt|invoice|credit_note|payment&status=...`, `POST /documents/{kind}/{id}/retry`.
 
 ### Signing in to the MES (`services/mes/auth.go`)
 
@@ -220,6 +226,7 @@ WMS_APP_DIR=~/Desktop/production-pos/point-of-sales scripts/e2e_wip_flow.sh     
 ./bin/cerp-bridge migrate && ./bin/cerp-bridge serve
 CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_bridge.sh                       # local ConstructionERP only
 CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_ap.sh                           # receipt → invoice → payment with WHT
+CERP_URL=http://127.0.0.1:8200 scripts/e2e_cerp_retention.sh                    # retention, credit note, refunds (23 checks)
 scripts/reconcile.sh   # read-only: does ERPNext hold exactly what WMS, ConstructionERP and MES say happened?
 ```
 
