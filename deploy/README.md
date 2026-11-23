@@ -1,11 +1,13 @@
 # K Garden on ServerKG
 
-Production stack for the company Mac server **ServerKG** (Apple silicon, Colima, `server@100.102.142.13`
-over Tailscale). One compose project, `kgarden`, next to the other KGF apps in `~/server/apps/kgarden`.
+Production stack for the company Mac server **ServerKG** (Apple silicon, Colima; `server@192.168.1.10` on
+the LAN, `server@100.102.142.13` over Tailscale). One compose project, `kgarden`, next to the other KGF
+apps in `~/server/apps/kgarden`. It follows the KGF deploy guide (DEPLOY.md): build on the dev Mac, ship
+images over SSH, Docker context `colima`, databases in the central `kgf-postgres` on network `kgf`.
 
 | Service | What | Memory cap |
 |---|---|---|
-| `db` | Postgres 17: the ERPNext site and `kgarden_mes` (MES + bridges) | 1 GB |
+| `kgf-postgres` (shared) | databases `kgarden_erp` (ERPNext) and `kgarden_mes` (MES + bridges) | — |
 | `redis-cache`, `redis-queue` | ERPNext cache and job queue | 256 MB each |
 | `frontend` → `backend` | ERPNext (nginx → gunicorn), `127.0.0.1:${ERP_PORT}` | 128 MB / 1.5 GB |
 | `websocket`, `queue-short`, `queue-long`, `scheduler` | ERPNext realtime, background jobs, scheduler | ~2.2 GB |
@@ -38,7 +40,8 @@ The image label `org.kgarden.commits` records which commits are inside (frappe a
 ```bash
 cd ~/server/apps/kgarden
 cp .env.example .env && chmod 600 .env     # fill the secrets: openssl rand -hex 24; MES_ORG_ID: uuidgen
-./kg.sh new-site          # Postgres, ERPNext site with erpnext + kgarden
+./kg.sh db-init           # kgarden_mes + its two roles in kgf-postgres
+./kg.sh new-site          # ERPNext site (database kgarden_erp in kgf-postgres) with erpnext + kgarden
 ./kg.sh setup-company     # setup wizard: COMPANY_NAME / COMPANY_ABBR / CHART_OF_ACCOUNTS (confirm with accounting)
 ./kg.sh provision         # service accounts, API keys, OAuth addresses -> .env; apps-credentials.env for CERP/WMS
 ./kg.sh up
@@ -59,8 +62,9 @@ deploy/build-erpnext.sh && deploy/kg.sh ship server@100.102.142.13
 
 ## Backups
 
-`./kg.sh backup` writes the ERPNext backup (database + files) and a `kgarden_mes` dump to
-`~/server/backups/kgarden`, keeping 14 days. Hook it into ServerKG's nightly `backup.sh`; the
+Both databases are in `kgf-postgres`, so ServerKG's nightly `pg_dumpall` (02:00) covers them.
+`./kg.sh backup` (launchd `com.kgf.kgarden-backup`, 02:30) adds the ERPNext files and site config
+plus a `kgarden_mes` dump in `~/server/backups/kgarden`, keeping 14 days. Hook it into ServerKG's nightly `backup.sh`; the
 server's off-box copy (`offbox.sh`) is not active yet, so nothing leaves the machine until it is.
 
 ## Rehearsal on the build Mac
@@ -68,7 +72,7 @@ server's off-box copy (`offbox.sh`) is not active yet, so nothing leaves the mac
 The same compose file runs locally in Colima with another env file:
 
 ```bash
-KG_ENV=/path/to/rehearsal.env deploy/kg.sh new-site   # etc.
+KG_ENV=/path/to/rehearsal.env deploy/kg.sh db-init    # DB_HOST='db': a local postgres:16 stands in for kgf-postgres
 ```
 
 Never point the e2e scripts at production: they create real documents.
@@ -87,3 +91,10 @@ suites wait for the droplet link. The whole stack used about 880 MB of memory.
 - frappe and erpnext are on `develop`; ship only commits that passed the suites.
 - The ERPNext backup includes `site_config` with the encryption key: keep backups as private as the server.
 - Off-box copies are not set up on ServerKG yet.
+
+## Port registry (KGF deploy guide §5)
+
+| Port | Used by | Access |
+|---|---|---|
+| 8010 | K Garden ERPNext (`kgarden-frontend-1`, DB `kgarden_erp`) | 127.0.0.1 + Cloudflare Tunnel `kgarden` (`erp.kgarden.co.th`) |
+| 8011 | K Garden MES floor tablets (`kgarden-floor-1`, DB `kgarden_mes`) | 127.0.0.1 + Cloudflare Tunnel `kgarden` (`mes.kgarden.co.th`) |

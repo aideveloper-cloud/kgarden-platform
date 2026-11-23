@@ -3,6 +3,7 @@
 # (ServerKG, or this Mac for a local rehearsal); `ship` runs on the build machine.
 #
 #   kg.sh up                     start / update everything (bridges only with WMS_ENABLED / CERP_ENABLED=1)
+#   kg.sh db-init                first install: database + roles for the MES/bridges in kgf-postgres
 #   kg.sh new-site               first install: create the ERPNext site with erpnext + kgarden
 #   kg.sh setup-company          first install: setup wizard (COMPANY_NAME, COMPANY_ABBR, ...)
 #   kg.sh provision [--rotate]   service accounts + API keys + OAuth addresses -> written into the
@@ -20,12 +21,25 @@ ENV_FILE=${KG_ENV:-.env}
 [[ $ENV_FILE == /* ]] || ENV_FILE=$PWD/$ENV_FILE
 [[ -f $ENV_FILE ]] || { echo "missing $ENV_FILE (copy .env.example)"; exit 1; }
 set -a; . "$ENV_FILE"; set +a
+# ServerKG also has Docker Desktop: the KGF stack (kgf-postgres, network kgf) is in Colima (KGF deploy guide).
+export DOCKER_CONTEXT=${KG_DOCKER_CONTEXT:-colima}
+DB_HOST=${DB_HOST:-kgf-postgres}
 profiles=()
 [[ ${WMS_ENABLED:-0} == 1 ]] && profiles+=(--profile wms)
 [[ ${CERP_ENABLED:-0} == 1 ]] && profiles+=(--profile cerp)
 [[ -n ${CF_TUNNEL_TOKEN:-} ]] && profiles+=(--profile tunnel)
+[[ $DB_HOST == db ]] && profiles+=(--profile localdb)
 dc() { docker compose --env-file "$ENV_FILE" ${profiles[@]+"${profiles[@]}"} "$@"; }  # bash 3.2-safe
 site_bench() { dc exec -T backend bench --site "$ERP_SITE" "$@"; }
+# psql as the database's admin, inside its own container (the admin password never leaves it).
+db_admin() {
+	if [[ $DB_HOST == db ]]; then dc exec -T db psql -U postgres -v ON_ERROR_STOP=1 "$@"
+	else docker exec -i "$DB_HOST" sh -c 'psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 "$@"' psql "$@"; fi
+}
+db_admin_cred() { # user and password for bench new-site
+	if [[ $DB_HOST == db ]]; then printf '%s\n%s\n' postgres "$PG_SUPERUSER_PASSWORD"
+	else docker exec "$DB_HOST" sh -c 'printf "%s\n%s\n" "$POSTGRES_USER" "$POSTGRES_PASSWORD"'; fi
+}
 
 cmd=${1:-}; shift || true
 case "$cmd" in
@@ -33,13 +47,37 @@ up)
 	dc up -d --remove-orphans
 	dc ps --format 'table {{.Service}}\t{{.Status}}'
 	;;
+db-init)
+	[[ $DB_HOST == db ]] && { dc up -d --wait db; }
+	# Idempotent: roles get (re)set passwords from .env; the database is created once.
+	db_admin -v owner_pw="$KG_MES_OWNER_PASSWORD" -v app_pw="$KG_MES_APP_PASSWORD" <<'SQL'
+SELECT format('CREATE ROLE %I LOGIN', r) FROM unnest(ARRAY['kgarden_mes_owner','kgarden_mes_app']) r
+	WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) \gexec
+ALTER ROLE kgarden_mes_owner PASSWORD :'owner_pw';
+ALTER ROLE kgarden_mes_app PASSWORD :'app_pw';
+SELECT 'CREATE DATABASE kgarden_mes OWNER kgarden_mes_owner'
+	WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'kgarden_mes') \gexec
+\c kgarden_mes
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+REVOKE CONNECT ON DATABASE kgarden_mes FROM PUBLIC;
+GRANT CONNECT ON DATABASE kgarden_mes TO kgarden_mes_owner, kgarden_mes_app;
+SQL
+	echo "database kgarden_mes ready in $DB_HOST"
+	;;
 new-site)
-	dc up -d db redis-cache redis-queue configurator backend
-	dc exec -T backend bench new-site "$ERP_SITE" \
-		--db-type postgres --db-host db --db-root-username postgres --db-root-password "$PG_SUPERUSER_PASSWORD" \
+	dc up -d redis-cache redis-queue configurator backend
+	{ read -r root_user; read -r root_pw; } < <(db_admin_cred)
+	dc exec -T backend bench new-site "$ERP_SITE" --db-name "${ERP_DB_NAME:-kgarden_erp}" \
+		--db-type postgres --db-host "$DB_HOST" --db-root-username "$root_user" --db-root-password "$root_pw" \
 		--admin-password "$ERP_ADMIN_PASSWORD" --install-app erpnext --install-app kgarden
+	unset root_pw
+	# Long-lived processes cache site_config for 60 s; one that cached it before the site's
+	# encryption_key existed would generate a new key and break every stored secret. Start fresh.
+	dc up -d --force-recreate backend
 	site_bench set-config host_name "$ERP_PUBLIC_URL"
 	site_bench set-config -p serve_default_site 1
+	# kgarden's after_migrate (apps + OAuth clients, employee-code sign-in) does not run on install.
+	site_bench execute kgarden.setup.after_migrate
 	site_bench enable-scheduler
 	dc exec -T backend bench use "$ERP_SITE"
 	dc up -d
@@ -90,6 +128,16 @@ with os.fdopen(fd, "w") as f:
 	f.writelines(f"{k}='{v}'\n" for k, v in data["apps"].items())
 print("updated", path, "and wrote", apps)
 PY
+	# Every key must work now; a site whose encryption key changed underneath fails here, not later.
+	set -a; . "$ENV_FILE"; set +a
+	bad=0
+	for pair in "MES_ERPNEXT_API_KEY:MES_ERPNEXT_API_SECRET" "MES_ACCESS_API_KEY:MES_ACCESS_API_SECRET" "CERP_ERPNEXT_API_KEY:CERP_ERPNEXT_API_SECRET"; do
+		k=${pair%%:*}; v=${pair#*:}
+		code=$(dc exec -T backend curl -s -o /dev/null -w '%{http_code}' -H "Host: $ERP_SITE" \
+			-H "Authorization: token ${!k}:${!v}" http://frontend:8080/api/method/frappe.auth.get_logged_user)
+		[[ $code == 200 ]] && echo "  key $k works" || { echo "  key $k refused ($code)"; bad=1; }
+	done
+	[[ $bad == 0 ]] || { echo "API keys do not work: run ./kg.sh provision --rotate, then ./kg.sh up"; exit 1; }
 	;;
 migrate)
 	dc up -d configurator backend
@@ -102,7 +150,9 @@ backup)
 	site_bench backup --with-files
 	cid=$(dc ps -q backend)
 	docker cp "$cid:/home/frappe/frappe-bench/sites/$ERP_SITE/private/backups/." "$dir/erpnext-$day/"
-	dc exec -T db pg_dump -U postgres -Fc kgarden_mes > "$dir/kgarden_mes-$day.dump"
+	# (kgf-postgres is also in ServerKG's nightly pg_dumpall; this keeps a copy next to the files.)
+	if [[ $DB_HOST == db ]]; then dc exec -T db pg_dump -U postgres -Fc kgarden_mes
+	else docker exec "$DB_HOST" sh -c 'pg_dump -U "$POSTGRES_USER" -Fc kgarden_mes'; fi > "$dir/kgarden_mes-$day.dump"
 	find "$dir" -mindepth 1 -maxdepth 1 -mtime +"${RETAIN_DAYS:-14}" -exec rm -rf {} +
 	echo "backup in $dir"
 	;;
@@ -112,11 +162,10 @@ logs) dc logs --tail 200 -f "$@" ;;
 ship)
 	target=${1:?ssh target, e.g. server@100.102.142.13}
 	for img in kgarden/erpnext:latest kgarden/platform:latest kgarden/floor:latest; do
-		echo "== $img"; docker save "$img" | gzip -1 | ssh "$target" 'export PATH=/opt/homebrew/bin:$PATH; gunzip | docker load'
+		echo "== $img"; docker save "$img" | gzip -1 | ssh "$target" 'export PATH=/opt/homebrew/bin:$PATH DOCKER_CONTEXT=colima; gunzip | docker load'
 	done
-	ssh "$target" 'mkdir -p ~/server/apps/kgarden/postgres-init'
-	scp -q compose.yaml kg.sh .env.example "$target:server/apps/kgarden/"
-	scp -q postgres-init/* "$target:server/apps/kgarden/postgres-init/"
+	ssh "$target" 'mkdir -p ~/server/apps/kgarden'
+	scp -q compose.yaml kg.sh .env.example README.md "$target:server/apps/kgarden/"
 	echo "shipped; on the server: cd ~/server/apps/kgarden && ./kg.sh up   (or migrate after an ERPNext update)"
 	;;
 *) sed -n '2,15p' "$0"; exit 2 ;;

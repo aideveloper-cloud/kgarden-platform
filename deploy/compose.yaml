@@ -1,6 +1,9 @@
 # K Garden production stack for ServerKG (Colima, linux/arm64). One compose project: "kgarden".
+# Follows the KGF deploy guide: databases live in the central kgf-postgres (network "kgf"), images are
+# built on the dev Mac and shipped over SSH, Docker context "colima".
 #
-#   ERPNext  : frontend (nginx) <- backend (gunicorn), websocket, workers, scheduler; Postgres + Redis
+#   ERPNext  : frontend (nginx) <- backend (gunicorn), websocket, workers, scheduler; Redis
+#   Database : ${DB_HOST} (kgf-postgres on ServerKG; service "db" with profile "localdb" for a rehearsal)
 #   Platform : mes, cerp-bridge, wms-bridge (profile "wms") and the floor tablet UI
 #
 # Nothing listens outside 127.0.0.1 (those ports are for checks on the server). The public names come
@@ -17,7 +20,7 @@ x-erpnext: &erpnext
   pull_policy: never
   restart: unless-stopped
   logging: *log
-  networks: [kgarden]
+  networks: [kgarden, kgf]
   volumes:
     - sites:/home/frappe/frappe-bench/sites
     - logs:/home/frappe/frappe-bench/logs
@@ -29,31 +32,30 @@ x-platform: &platform
   pull_policy: never
   restart: unless-stopped
   logging: *log
-  networks: [kgarden]
+  networks: [kgarden, kgf]
   depends_on:
     platform-migrate: { condition: service_completed_successfully }
   environment: &platform-env
     TZ: Asia/Bangkok
     MES_ORG_ID: ${MES_ORG_ID:?}
-    MES_DB_URL: postgres://kgarden_mes_app:${KG_MES_APP_PASSWORD:?}@db:5432/kgarden_mes
+    MES_DB_URL: postgres://kgarden_mes_app:${KG_MES_APP_PASSWORD:?}@${DB_HOST:-kgf-postgres}:5432/kgarden_mes
     ERPNEXT_URL: http://frontend:8080
 
 services:
+  # Rehearsal only (DB_HOST=db, profile localdb): stands in for kgf-postgres, same major version.
   db:
-    image: postgres:17
+    image: ${KG_LOCAL_DB_IMAGE:-postgres:16}
+    profiles: [localdb]
     restart: unless-stopped
     logging: *log
     networks: [kgarden]
     mem_limit: 1g
     shm_size: 256m
     environment:
-      POSTGRES_PASSWORD: ${PG_SUPERUSER_PASSWORD:?}
-      KG_MES_OWNER_PASSWORD: ${KG_MES_OWNER_PASSWORD:?}
-      KG_MES_APP_PASSWORD: ${KG_MES_APP_PASSWORD:?}
+      POSTGRES_PASSWORD: ${PG_SUPERUSER_PASSWORD:-}
       TZ: Asia/Bangkok
     volumes:
       - db:/var/lib/postgresql/data
-      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "postgres"]
       interval: 5s
@@ -81,13 +83,13 @@ services:
     <<: *erpnext
     restart: "no"
     depends_on:
-      db: { condition: service_healthy }
+      db: { condition: service_healthy, required: false }
     entrypoint: ["bash", "-c"]
     command:
       - >
         ls -1 apps > sites/apps.txt;
         bench set-config -g db_type postgres;
-        bench set-config -g db_host db;
+        bench set-config -g db_host ${DB_HOST:-kgf-postgres};
         bench set-config -gp db_port 5432;
         bench set-config -g redis_cache redis://redis-cache:6379;
         bench set-config -g redis_queue redis://redis-queue:6379;
@@ -145,9 +147,9 @@ services:
     <<: *platform
     restart: "no"
     depends_on:
-      db: { condition: service_healthy }
+      db: { condition: service_healthy, required: false }
     environment:
-      MES_DB_OWNER_URL: postgres://kgarden_mes_owner:${KG_MES_OWNER_PASSWORD:?}@db:5432/kgarden_mes
+      MES_DB_OWNER_URL: postgres://kgarden_mes_owner:${KG_MES_OWNER_PASSWORD:?}@${DB_HOST:-kgf-postgres}:5432/kgarden_mes
     entrypoint: ["sh", "-c", "mes migrate && wms-bridge migrate && cerp-bridge migrate"]
 
   mes:
