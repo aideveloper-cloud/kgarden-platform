@@ -4,7 +4,13 @@ package main
 //
 //	receipt (confirmed)              -> Purchase Receipt against the booked ERPNext PO
 //	invoice (payable; approved/sent/paid) -> Purchase Invoice (against the PO when there is one)
+//	credit note (invoice reversed)   -> Debit Note: a return of the whole Purchase Invoice
 //	payment (on a payable invoice)   -> Payment Entry: cash to the supplier + Thai WHT as a deduction
+//	refund (supplier pays us back)   -> Payment Entry, Receive from the supplier
+//
+// Retention (เงินประกันผลงาน) is not a separate posting: the Purchase Invoice carries the gross and
+// a payment settles only cash + WHT, so the retention held stays owed to the supplier on that
+// invoice until a later payment releases it.
 //
 // Each kind is read like purchase orders (updated_at cursor with look-back, content hash) into
 // cerp_bridge.doc_state and posted with its own idempotency key. A document whose prerequisite is
@@ -108,14 +114,24 @@ type Payment struct {
 	ID            string `json:"id"`
 	InvoiceID     string `json:"invoice_id"`
 	Date          string `json:"payment_date"`
-	Amount        string `json:"amount"` // cash to the supplier
+	Amount        string `json:"amount"` // cash to the supplier (to us, on a refund)
 	Reference     string `json:"reference"`
 	Refund        bool   `json:"is_refund"`
+	Withholding   string `json:"withholding_amount,omitempty"` // retention held back on this payment; stays owed on the invoice
 	WhtType       string `json:"wht_type"`
 	WhtRate       string `json:"wht_rate"`
 	WhtAmount     string `json:"wht_amount"`
 	WhtCertNo     string `json:"wht_certificate_no"`
 	updatedAtRead time.Time
+}
+
+// CreditNote is a ConstructionERP invoice reversed after it was paid (status credit_note_issued).
+// ConstructionERP reverses the whole invoice, so ERPNext gets a return of the whole Purchase Invoice.
+type CreditNote struct {
+	InvoiceID string `json:"invoice_id"`
+	Number    string `json:"invoice_number"`
+	Date      string `json:"date"` // the day it was reversed (ConstructionERP keeps no separate date)
+	Total     string `json:"amount_total"`
 }
 
 func hashOf(v any) string {
@@ -185,14 +201,14 @@ func (r *Reader) recordDocs(ctx context.Context, kind string, rows []docRow, aft
 					sync_status = 'pending', attempts = 0, next_attempt_at = now(), last_error = ''
 				WHERE cerp_bridge.doc_state.live IS DISTINCT FROM EXCLUDED.live
 					OR cerp_bridge.doc_state.content_hash IS DISTINCT FROM EXCLUDED.content_hash`,
-				kind, d.id, d.ref, d.status, d.live, hashOf(d.payload), d.payload, d.updatedAt)
+				d.kind, d.id, d.ref, d.status, d.live, hashOf(d.payload), d.payload, d.updatedAt)
 			if err != nil {
-				return fmt.Errorf("record %s %s: %w", kind, d.ref, err)
+				return fmt.Errorf("record %s %s: %w", d.kind, d.ref, err)
 			}
 			if tag.RowsAffected() > 0 {
 				changed++
 			} else if _, err := tx.Exec(ctx, `UPDATE cerp_bridge.doc_state SET cerp_status = $3 WHERE kind = $1 AND cerp_id = $2`,
-				kind, d.id, d.status); err != nil {
+				d.kind, d.id, d.status); err != nil {
 				return err
 			}
 		}
@@ -312,6 +328,10 @@ func (r *Reader) readInvoices(ctx context.Context, since time.Time) ([]docRow, e
 			return nil, err
 		}
 		out = append(out, docRow{"invoice", v.ID, v.Number, v.Status, liveInvoiceStatuses[v.Status], v, v.updatedAtRead})
+		if v.Status == "credit_note_issued" {
+			cn := CreditNote{InvoiceID: v.ID, Number: v.Number, Date: v.updatedAtRead.In(bangkok).Format("2006-01-02"), Total: v.Total}
+			out = append(out, docRow{"credit_note", v.ID, "CN " + v.Number, v.Status, true, cn, v.updatedAtRead})
+		}
 	}
 	return out, nil
 }
@@ -320,7 +340,7 @@ func (r *Reader) readPayments(ctx context.Context, since time.Time) ([]docRow, e
 	rows, err := r.cerp.Query(ctx, `
 		SELECT p.id::text, p.invoice_id::text, p.payment_date, p.amount::text, coalesce(p.reference, ''), p.is_refund,
 			coalesce(p.wht_type, ''), coalesce(p.wht_rate, ''), coalesce(p.wht_amount, 0)::text, coalesce(p.wht_certificate_no, ''),
-			inv.invoice_number, p.updated_at
+			coalesce(p.withholding_amount, 0)::text, inv.invoice_number, p.updated_at
 		FROM oe_finance_payment p JOIN oe_finance_invoice inv ON inv.id = p.invoice_id
 		WHERE inv.invoice_direction = 'payable' AND p.updated_at > $1
 		ORDER BY p.updated_at LIMIT 500`, since)
@@ -333,10 +353,17 @@ func (r *Reader) readPayments(ctx context.Context, since time.Time) ([]docRow, e
 		var p Payment
 		var invNo string
 		if err := rows.Scan(&p.ID, &p.InvoiceID, &p.Date, &p.Amount, &p.Reference, &p.Refund,
-			&p.WhtType, &p.WhtRate, &p.WhtAmount, &p.WhtCertNo, &invNo, &p.updatedAtRead); err != nil {
+			&p.WhtType, &p.WhtRate, &p.WhtAmount, &p.WhtCertNo, &p.Withholding, &invNo, &p.updatedAtRead); err != nil {
 			return nil, err
 		}
-		out = append(out, docRow{"payment", p.ID, invNo + " / " + p.Date, "recorded", true, p, p.updatedAtRead})
+		if isZero(p.Withholding) {
+			p.Withholding = "" // keeps the hash of payments read before retention was booked
+		}
+		ref := invNo + " / " + p.Date
+		if p.Refund {
+			ref = invNo + " / refund " + p.Date
+		}
+		out = append(out, docRow{"payment", p.ID, ref, "recorded", true, p, p.updatedAtRead})
 	}
 	return out, rows.Err()
 }
@@ -351,9 +378,9 @@ type docState struct {
 	Attempts              int
 }
 
-var docDoctype = map[string]string{"receipt": "Purchase Receipt", "invoice": "Purchase Invoice", "payment": "Payment Entry"}
+var docDoctype = map[string]string{"receipt": "Purchase Receipt", "invoice": "Purchase Invoice", "credit_note": "Purchase Invoice", "payment": "Payment Entry"}
 
-// DrainDocs posts due documents, receipts and invoices before payments.
+// DrainDocs posts due documents: receipts, invoices and credit notes before payments.
 func (p *Poster) DrainDocs(ctx context.Context) (int, error) {
 	n := 0
 	for {
@@ -373,7 +400,7 @@ func (p *Poster) processDoc(ctx context.Context) (bool, error) {
 			SELECT kind, cerp_id::text, ref, cerp_status, live, payload, coalesce(erpnext_doc, ''), attempts
 			FROM cerp_bridge.doc_state
 			WHERE sync_status = 'pending' AND next_attempt_at <= now()
-			ORDER BY CASE kind WHEN 'receipt' THEN 1 WHEN 'invoice' THEN 2 ELSE 3 END, cerp_updated_at
+			ORDER BY CASE kind WHEN 'receipt' THEN 1 WHEN 'invoice' THEN 2 WHEN 'credit_note' THEN 3 ELSE 4 END, cerp_updated_at
 			LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&s.Kind, &s.ID, &s.Ref, &s.Status, &s.Live, &s.Payload, &s.ERPNextDoc, &s.Attempts)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -448,6 +475,8 @@ func (p *Poster) reconcileDoc(ctx context.Context, tx pgx.Tx, s *docState) (stri
 		build = p.buildReceipt
 	case "invoice":
 		build = p.buildInvoice
+	case "credit_note":
+		build = p.buildCreditNote
 	default:
 		build = p.buildPayment
 	}
@@ -569,9 +598,6 @@ func (p *Poster) buildInvoice(ctx context.Context, tx pgx.Tx, s *docState, key s
 	if err := json.Unmarshal(s.Payload, &v); err != nil {
 		return nil, "", err
 	}
-	if !isZero(v.Retention) {
-		return nil, "", &permanentError{"invoices with retention are not booked yet"}
-	}
 	supplier, err := p.ensureSupplier(ctx, &PO{VendorID: v.VendorID, VendorName: v.VendorName, VendorTaxID: v.VendorTaxID})
 	if err != nil {
 		return nil, "", fmt.Errorf("supplier: %w", err)
@@ -642,6 +668,10 @@ func (p *Poster) buildInvoice(ctx context.Context, tx pgx.Tx, s *docState, key s
 	doc["project"] = project
 	doc["kg_idempotency_key"], doc["kg_cerp_invoice_number"] = key, v.Number
 	doc["remarks"] = "ConstructionERP invoice " + v.Number
+	if !isZero(v.Retention) {
+		doc["kg_retention_amount"] = json.Number(v.Retention)
+		doc["remarks"] = fmt.Sprintf("ConstructionERP invoice %s\nเงินประกันผลงาน %s บาท: หักไว้ตอนจ่าย ค้างอยู่ในใบนี้จนกว่าจะคืน", v.Number, v.Retention)
+	}
 	return cleanDocMap(doc), v.Total, nil
 }
 
@@ -656,39 +686,112 @@ func (p *Poster) freeLine(line InvoiceItem, project string) map[string]any {
 	}
 }
 
+// bookedInvoice is the ERPNext Purchase Invoice standing for a ConstructionERP invoice.
+func bookedInvoice(ctx context.Context, tx pgx.Tx, invoiceID string) (string, error) {
+	var pi string
+	err := tx.QueryRow(ctx, `SELECT coalesce(erpnext_doc, '') FROM cerp_bridge.doc_state
+		WHERE kind = 'invoice' AND cerp_id::text = $1 AND sync_status = 'synced'`, invoiceID).Scan(&pi)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && pi == "") {
+		return "", fmt.Errorf("invoice %s is not booked in ERPNext yet", invoiceID)
+	}
+	return pi, err
+}
+
+// buildCreditNote returns the whole Purchase Invoice (ERPNext Debit Note). It lowers the original
+// invoice's outstanding, so a paid invoice then shows what the supplier owes back.
+func (p *Poster) buildCreditNote(ctx context.Context, tx pgx.Tx, s *docState, key string) (map[string]any, string, error) {
+	var cn CreditNote
+	if err := json.Unmarshal(s.Payload, &cn); err != nil {
+		return nil, "", err
+	}
+	pi, err := bookedInvoice(ctx, tx, cn.InvoiceID)
+	if err != nil {
+		return nil, "", err
+	}
+	doc, err := p.erp.CallMethod(ctx, "erpnext.accounts.doctype.purchase_invoice.mapper.make_debit_note",
+		map[string]any{"source_name": pi})
+	if err != nil {
+		return nil, "", fmt.Errorf("map debit note from %s: %w", pi, err)
+	}
+	doc["posting_date"], doc["set_posting_time"] = cn.Date, 1
+	doc["bill_no"], doc["bill_date"] = "CN "+cn.Number, cn.Date
+	doc["update_outstanding_for_self"] = 0 // against the original invoice, where payments and refunds sit
+	doc["kg_idempotency_key"], doc["kg_cerp_invoice_number"] = key, cn.Number
+	doc["kg_retention_amount"] = 0
+	doc["remarks"] = "ConstructionERP credit note for invoice " + cn.Number
+	delete(doc, "due_date")
+	delete(doc, "payment_schedule")
+	return cleanDocMap(doc), "-" + strings.TrimPrefix(cn.Total, "-"), nil
+}
+
 func (p *Poster) buildPayment(ctx context.Context, tx pgx.Tx, s *docState, key string) (map[string]any, string, error) {
 	var pay Payment
 	if err := json.Unmarshal(s.Payload, &pay); err != nil {
 		return nil, "", err
 	}
-	if pay.Refund {
-		return nil, "", &permanentError{"supplier refunds are not booked yet"}
-	}
 	if err := checkNotFuture(pay.Date); err != nil {
 		return nil, "", err
 	}
-	var pi string
-	err := tx.QueryRow(ctx, `SELECT coalesce(erpnext_doc, '') FROM cerp_bridge.doc_state
-		WHERE kind = 'invoice' AND cerp_id::text = $1 AND sync_status = 'synced'`, pay.InvoiceID).Scan(&pi)
-	if errors.Is(err, pgx.ErrNoRows) || pi == "" {
-		return nil, "", fmt.Errorf("invoice %s is not booked in ERPNext yet", pay.InvoiceID)
-	}
+	pi, err := bookedInvoice(ctx, tx, pay.InvoiceID)
 	if err != nil {
 		return nil, "", err
 	}
-	doc, err := p.erp.CallMethod(ctx, "erpnext.accounts.doctype.payment_entry.payment_entry.get_payment_entry",
-		map[string]any{"dt": "Purchase Invoice", "dn": pi})
-	if err != nil {
-		return nil, "", fmt.Errorf("map payment from %s: %w", pi, err)
+	// What the supplier owes back after a credit note sits on the Debit Note when the invoice was
+	// already paid (ERPNext keeps it there), else on the invoice; a refund is mapped from it.
+	sources := []string{pi}
+	if pay.Refund {
+		var cnStatus, dn string
+		err := tx.QueryRow(ctx, `SELECT sync_status, coalesce(erpnext_doc, '') FROM cerp_bridge.doc_state
+			WHERE kind = 'credit_note' AND cerp_id::text = $1`, pay.InvoiceID).Scan(&cnStatus, &dn)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", err
+		}
+		if err == nil && cnStatus != "synced" {
+			return nil, "", fmt.Errorf("credit note for invoice %s is not booked in ERPNext yet", pay.InvoiceID)
+		}
+		if dn != "" {
+			sources = []string{dn, pi}
+		}
+	}
+	var doc, ref map[string]any
+	outstanding := 0.0
+	for _, src := range sources {
+		doc, err = p.erp.CallMethod(ctx, "erpnext.accounts.doctype.payment_entry.payment_entry.get_payment_entry",
+			map[string]any{"dt": "Purchase Invoice", "dn": src})
+		if err != nil {
+			return nil, "", fmt.Errorf("map payment from %s: %w", src, err)
+		}
+		ref, outstanding = nil, 0
+		if refs := asList(doc["references"]); len(refs) > 0 {
+			ref = refs[0].(map[string]any)
+			outstanding = num(ref["outstanding_amount"])
+		}
+		if !pay.Refund || outstanding < 0 {
+			break
+		}
 	}
 	cash, wht := parseNum(pay.Amount), parseNum(pay.WhtAmount)
-	refs := asList(doc["references"])
-	if len(refs) == 0 {
-		return nil, "", fmt.Errorf("purchase invoice %s has nothing outstanding", pi)
+	var references []any
+	if pay.Refund {
+		// Money back from the supplier. Against a credit note's balance (the invoice outstanding is
+		// negative) it is allocated there; otherwise it returns an overpayment and stays unallocated.
+		if doc["payment_type"] != "Receive" {
+			doc["payment_type"] = "Receive"
+			doc["paid_from"], doc["paid_to"] = doc["paid_to"], doc["paid_from"]
+			doc["paid_from_account_currency"], doc["paid_to_account_currency"] = doc["paid_to_account_currency"], doc["paid_from_account_currency"]
+			doc["paid_from_account_type"], doc["paid_to_account_type"] = doc["paid_to_account_type"], doc["paid_from_account_type"]
+		}
+		if outstanding < 0 {
+			ref["allocated_amount"] = -round2(math.Min(cash, -outstanding))
+			references = append(references, ref)
+		}
+	} else if outstanding > 0 {
+		// Cash + WHT settle the invoice; retention held stays outstanding until it is released.
+		// More than is outstanding (an overpayment) is left unallocated, as an advance to the supplier.
+		ref["allocated_amount"] = round2(math.Min(cash+wht, outstanding))
+		references = append(references, ref)
 	}
-	ref := refs[0].(map[string]any)
-	ref["allocated_amount"] = round2(cash + wht)
-	doc["references"] = []any{ref}
+	doc["references"] = references
 	doc["paid_amount"], doc["received_amount"] = round2(cash), round2(cash)
 	doc["source_exchange_rate"], doc["target_exchange_rate"] = 1, 1
 	doc["posting_date"], doc["reference_date"] = pay.Date, pay.Date
@@ -699,7 +802,7 @@ func (p *Poster) buildPayment(ctx context.Context, tx pgx.Tx, s *docState, key s
 	doc["reference_no"] = refNo
 	doc["kg_idempotency_key"] = key
 	var deductions []any
-	if wht > 0 {
+	if wht > 0 && !pay.Refund {
 		costCenter, err := p.companyCostCenter(ctx)
 		if err != nil {
 			return nil, "", err
@@ -716,7 +819,15 @@ func (p *Poster) buildPayment(ctx context.Context, tx pgx.Tx, s *docState, key s
 		}
 	}
 	doc["deductions"] = deductions
-	doc["remarks"] = "ConstructionERP payment " + s.Ref
+	remarks := "ConstructionERP payment " + s.Ref
+	if pay.Refund {
+		remarks = "ConstructionERP refund from supplier " + s.Ref
+	}
+	if held := parseNum(pay.Withholding); held > 0 {
+		doc["kg_retention_held"] = round2(held)
+		remarks += fmt.Sprintf("\nหักเงินประกันผลงานไว้ %.2f บาท (ยังค้างจ่ายในใบแจ้งหนี้)", held)
+	}
+	doc["remarks"] = remarks
 	return cleanDocMap(doc), "", nil
 }
 

@@ -61,19 +61,32 @@ orphan=$(jq -rn --argjson l "$live" --argjson b "$booked" '$b[] | select($l[.kg_
 
 echo "== ConstructionERP payables → ERPNext"
 cerp_inv=$(psql "$CERP_DB_URL" -qtAc "SELECT coalesce(json_object_agg(id::text, amount_total), '{}') FROM oe_finance_invoice
-	WHERE invoice_direction = 'payable' AND status IN ('approved','sent','paid','credit_note_issued') AND coalesce(retention_amount, 0) = 0")
-pis=$(erp_list "Purchase Invoice" '["kg_idempotency_key","grand_total"]' '[["kg_idempotency_key","like","cerp-invoice-%"],["docstatus","=",1]]')
+	WHERE invoice_direction = 'payable' AND status IN ('approved','sent','paid','credit_note_issued')")
+pis=$(erp_list "Purchase Invoice" '["kg_idempotency_key","grand_total","kg_retention_amount"]' '[["kg_idempotency_key","like","cerp-invoice-%"],["docstatus","=",1]]')
 miss=$(jq -rn --argjson c "$cerp_inv" --argjson p "$pis" '$c | to_entries[] | . as $e | select(([$p[]|select(.kg_idempotency_key=="cerp-invoice-"+$e.key)]|length) != 1) | $e.key')
 off=$(jq -rn --argjson c "$cerp_inv" --argjson p "$pis" '$p[] | (.kg_idempotency_key|sub("cerp-invoice-";"")) as $id | select($c[$id] == null or (($c[$id] - .grand_total)|fabs) > 0.005) | $id')
 [[ -z $miss ]] && ok "all $(jq length <<<"$cerp_inv") live supplier invoices have one Purchase Invoice" || bad "invoices not booked: $(echo $miss)"
 [[ -z $off ]] && ok "invoice totals equal, no Purchase Invoice for a cancelled invoice" || bad "invoice differs or not live: $(echo $off)"
+read -r cerp_ret cerp_cn_n cerp_cn <<<"$(psql "$CERP_DB_URL" -qtAF' ' -c "SELECT coalesce(sum(retention_amount),0),
+	count(*) FILTER (WHERE status = 'credit_note_issued'), coalesce(sum(amount_total) FILTER (WHERE status = 'credit_note_issued'),0)
+	FROM oe_finance_invoice WHERE invoice_direction = 'payable' AND status IN ('approved','sent','paid','credit_note_issued')")"
+erp_ret=$(jq '[.[].kg_retention_amount // 0]|add // 0' <<<"$pis")
+[[ $(jq -n "($cerp_ret - $erp_ret)|fabs < 0.005") == true ]] && ok "retention on invoices equal: $erp_ret" || bad "retention: ConstructionERP $cerp_ret, ERPNext $erp_ret"
+dns=$(erp_list "Purchase Invoice" '["grand_total"]' '[["kg_idempotency_key","like","cerp-credit_note-%"],["docstatus","=",1]]')
+[[ $(jq length <<<"$dns") == "$cerp_cn_n" && $(jq -n --argjson d "$dns" "($cerp_cn + ([\$d[].grand_total]|add // 0))|fabs < 0.005") == true ]] \
+	&& ok "$cerp_cn_n credit notes booked as Debit Notes" || bad "credit notes: ConstructionERP $cerp_cn_n ($cerp_cn), ERPNext $(jq length <<<"$dns")"
 read -r cerp_cash cerp_wht <<<"$(psql "$CERP_DB_URL" -qtAF' ' -c "SELECT coalesce(sum(p.amount),0), coalesce(sum(p.wht_amount),0)
 	FROM oe_finance_payment p JOIN oe_finance_invoice i ON i.id = p.invoice_id
 	WHERE i.invoice_direction = 'payable' AND NOT p.is_refund AND p.payment_date::date <= (now() AT TIME ZONE 'Asia/Bangkok')::date")"
-pes=$(erp_list "Payment Entry" '["paid_amount","total_allocated_amount"]' '[["kg_idempotency_key","like","cerp-payment-%"],["docstatus","=",1]]')
-erp_cash=$(jq '[.[].paid_amount]|add // 0' <<<"$pes"); erp_wht=$(jq '[.[] | .total_allocated_amount - .paid_amount]|add // 0' <<<"$pes")
+pes=$(erp_list "Payment Entry" '["paid_amount","total_allocated_amount","unallocated_amount"]' '[["kg_idempotency_key","like","cerp-payment-%"],["docstatus","=",1],["payment_type","=","Pay"]]')
+# WHT = what settled the supplier beyond the cash (allocated + left as advance - cash).
+erp_cash=$(jq '[.[].paid_amount]|add // 0' <<<"$pes"); erp_wht=$(jq '[.[] | .total_allocated_amount + .unallocated_amount - .paid_amount]|add // 0' <<<"$pes")
 [[ $(jq -n "($cerp_cash - $erp_cash)|fabs < 0.005") == true ]] && ok "cash paid equal: $erp_cash" || bad "cash paid: ConstructionERP $cerp_cash, ERPNext $erp_cash"
 [[ $(jq -n "($cerp_wht - $erp_wht)|fabs < 0.005") == true ]] && ok "WHT withheld equal: $erp_wht" || bad "WHT: ConstructionERP $cerp_wht, ERPNext $erp_wht"
+cerp_refund=$(psql "$CERP_DB_URL" -qtAc "SELECT coalesce(sum(p.amount),0) FROM oe_finance_payment p JOIN oe_finance_invoice i ON i.id = p.invoice_id
+	WHERE i.invoice_direction = 'payable' AND p.is_refund AND p.payment_date::date <= (now() AT TIME ZONE 'Asia/Bangkok')::date")
+erp_refund=$(erp_list "Payment Entry" '["received_amount"]' '[["kg_idempotency_key","like","cerp-payment-%"],["docstatus","=",1],["payment_type","=","Receive"]]' | jq '[.[].received_amount]|add // 0')
+[[ $(jq -n "($cerp_refund - $erp_refund)|fabs < 0.005") == true ]] && ok "refunds from suppliers equal: $erp_refund" || bad "refunds: ConstructionERP $cerp_refund, ERPNext $erp_refund"
 dead=$(psql "$PG" -qtAc "SELECT count(*) FROM cerp_bridge.doc_state WHERE sync_status = 'dead'")
 [[ $dead == 0 ]] && ok "no dead receipts/invoices/payments" || bad "$dead dead documents (GET /documents?status=dead)"
 
