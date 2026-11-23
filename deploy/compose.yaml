@@ -177,15 +177,17 @@ services:
     depends_on: [mes]
 
   # Reads ConstructionERP (kgf_construction in kgf-postgres, on the shared "kgf" network).
+  # Profile "cerp" (CERP_ENABLED=1) once ConstructionERP runs th-main and the read-only role exists.
   cerp-bridge:
     <<: *platform
+    profiles: [cerp]
     mem_limit: 128m
     networks: [kgarden, kgf]
     command: ["cerp-bridge", "serve"]
     environment:
       <<: *platform-env
       CERP_BRIDGE_HTTP_ADDR: 0.0.0.0:8102
-      CERP_DB_URL: ${CERP_DB_URL:?}
+      CERP_DB_URL: ${CERP_DB_URL:-}
       CERP_ERPNEXT_API_KEY: ${CERP_ERPNEXT_API_KEY:-}
       CERP_ERPNEXT_API_SECRET: ${CERP_ERPNEXT_API_SECRET:-}
       CERP_BRIDGE_COMPANY: ${CERP_BRIDGE_COMPANY:-KGF Construction}

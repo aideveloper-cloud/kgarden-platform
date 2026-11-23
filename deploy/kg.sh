@@ -2,7 +2,7 @@
 # Operate the K Garden stack (deploy/compose.yaml). Run on the machine that runs the stack
 # (ServerKG, or this Mac for a local rehearsal); `ship` runs on the build machine.
 #
-#   kg.sh up                     start / update everything (wms-bridge only with WMS_ENABLED=1)
+#   kg.sh up                     start / update everything (bridges only with WMS_ENABLED / CERP_ENABLED=1)
 #   kg.sh new-site               first install: create the ERPNext site with erpnext + kgarden
 #   kg.sh setup-company          first install: setup wizard (COMPANY_NAME, COMPANY_ABBR, ...)
 #   kg.sh provision [--rotate]   service accounts + API keys + OAuth addresses -> written into the
@@ -20,7 +20,9 @@ ENV_FILE=${KG_ENV:-.env}
 [[ $ENV_FILE == /* ]] || ENV_FILE=$PWD/$ENV_FILE
 [[ -f $ENV_FILE ]] || { echo "missing $ENV_FILE (copy .env.example)"; exit 1; }
 set -a; . "$ENV_FILE"; set +a
-profiles=(); [[ ${WMS_ENABLED:-0} == 1 ]] && profiles=(--profile wms)
+profiles=()
+[[ ${WMS_ENABLED:-0} == 1 ]] && profiles+=(--profile wms)
+[[ ${CERP_ENABLED:-0} == 1 ]] && profiles+=(--profile cerp)
 dc() { docker compose --env-file "$ENV_FILE" "${profiles[@]}" "$@"; }
 site_bench() { dc exec -T backend bench --site "$ERP_SITE" "$@"; }
 
