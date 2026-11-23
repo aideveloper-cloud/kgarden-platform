@@ -49,7 +49,7 @@ check "operator can see Work Orders" "$(code_of "$(mes op GET /work-orders)")" 2
 check "operator cannot pull Work Orders (supervisor work)" "$(code_of "$(mes op POST /sync/work-orders)")" 403
 
 echo "3. Actions are recorded under the signed-in person, not a typed name"
-WO=$(mes op GET /work-orders | sed '$d' | jq -r '[.data[] | select(.running == false)][0].name // empty')
+WO=$(mes op GET /work-orders | sed '$d' | jq -r '[(.data // [])[] | select(.running == false)][0].name // empty')
 if [[ -n "$WO" ]]; then
 	mes op POST "/work-orders/$WO/start" '{"operator":"ชื่อที่พิมพ์เอง"}' >/dev/null
 	who=$(mes op GET "/work-orders/$WO" | sed '$d' | jq -r '.operation_logs[-1].operator')

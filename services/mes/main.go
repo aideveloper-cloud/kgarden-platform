@@ -96,6 +96,8 @@ func serve(ctx context.Context) error {
 			ClientID:     mustEnv("MES_OIDC_CLIENT_ID"),
 			ClientSecret: mustEnv("MES_OIDC_CLIENT_SECRET"),
 			RedirectURI:  mustEnv("MES_OIDC_REDIRECT_URI"),
+			// In Docker ERPNEXT_URL is an internal address; the browser needs the public one.
+			PublicBase: publicERPNextURL(),
 		},
 		ttl:  durationEnv("MES_SESSION_TTL", 12*time.Hour),
 		http: &http.Client{Timeout: 15 * time.Second},
@@ -129,4 +131,16 @@ func durationEnv(key string, def time.Duration) time.Duration {
 		os.Exit(2)
 	}
 	return def
+}
+
+// publicERPNextURL is ERPNext as a browser reaches it: ERPNEXT_PUBLIC_URL, else ERPNEXT_URL.
+func publicERPNextURL() string {
+	u := os.Getenv("ERPNEXT_PUBLIC_URL")
+	if u == "" {
+		u = os.Getenv("ERPNEXT_URL")
+	}
+	for len(u) > 0 && u[len(u)-1] == '/' {
+		u = u[:len(u)-1]
+	}
+	return u
 }

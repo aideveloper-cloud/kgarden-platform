@@ -1,0 +1,8 @@
+.env
+.git
+bin
+deploy/secrets
+**/node_modules
+apps/floor/.svelte-kit
+apps/floor/build
+*.log

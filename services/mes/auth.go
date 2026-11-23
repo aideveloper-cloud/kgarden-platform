@@ -40,6 +40,7 @@ const (
 
 type OIDCConfig struct {
 	ClientID, ClientSecret, RedirectURI string
+	PublicBase                          string // ERPNext as the tablet's browser reaches it (sign-in page)
 }
 
 type Auth struct {
@@ -227,7 +228,7 @@ func (a *Auth) oidcStart(w http.ResponseWriter, r *http.Request) {
 	}
 	q := url.Values{"client_id": {a.oidc.ClientID}, "response_type": {"code"}, "scope": {"openid all"},
 		"redirect_uri": {a.oidc.RedirectURI}, "state": {state}}
-	writeJSON(w, 200, map[string]string{"url": a.access.Base() + "/api/method/frappe.integrations.oauth2.authorize?" + q.Encode()})
+	writeJSON(w, 200, map[string]string{"url": a.oidc.PublicBase + "/api/method/frappe.integrations.oauth2.authorize?" + q.Encode()})
 }
 
 func (a *Auth) oidcCallback(w http.ResponseWriter, r *http.Request) {

@@ -1,0 +1,223 @@
+# K Garden production stack for ServerKG (Colima, linux/arm64). One compose project: "kgarden".
+#
+#   ERPNext  : frontend (nginx) <- backend (gunicorn), websocket, workers, scheduler; Postgres + Redis
+#   Platform : mes, cerp-bridge, wms-bridge (profile "wms") and the floor tablet UI
+#
+# Nothing listens outside 127.0.0.1: the host's Cloudflare Tunnel publishes
+#   ${ERP_HOST} -> 127.0.0.1:${ERP_PORT}     ${MES_HOST} -> 127.0.0.1:${MES_PORT}
+# Secrets live in deploy/.env (mode 600) next to this file; see .env.example.
+name: kgarden
+
+x-log: &log
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+x-erpnext: &erpnext
+  image: kgarden/erpnext:${ERPNEXT_TAG:-latest}
+  pull_policy: never
+  restart: unless-stopped
+  logging: *log
+  networks: [kgarden]
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  depends_on:
+    configurator: { condition: service_completed_successfully }
+
+x-platform: &platform
+  image: kgarden/platform:${PLATFORM_TAG:-latest}
+  pull_policy: never
+  restart: unless-stopped
+  logging: *log
+  networks: [kgarden]
+  depends_on:
+    platform-migrate: { condition: service_completed_successfully }
+  environment: &platform-env
+    TZ: Asia/Bangkok
+    MES_ORG_ID: ${MES_ORG_ID:?}
+    MES_DB_URL: postgres://kgarden_mes_app:${KG_MES_APP_PASSWORD:?}@db:5432/kgarden_mes
+    ERPNEXT_URL: http://frontend:8080
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    logging: *log
+    networks: [kgarden]
+    mem_limit: 1g
+    shm_size: 256m
+    environment:
+      POSTGRES_PASSWORD: ${PG_SUPERUSER_PASSWORD:?}
+      KG_MES_OWNER_PASSWORD: ${KG_MES_OWNER_PASSWORD:?}
+      KG_MES_APP_PASSWORD: ${KG_MES_APP_PASSWORD:?}
+      TZ: Asia/Bangkok
+    volumes:
+      - db:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 5s
+      retries: 30
+
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *log
+    networks: [kgarden]
+    mem_limit: 256m
+    command: ["redis-server", "--maxmemory", "192mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *log
+    networks: [kgarden]
+    mem_limit: 256m
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis-queue:/data]
+
+  # Writes the shared bench config (database, redis) into the sites volume on every start.
+  configurator:
+    <<: *erpnext
+    restart: "no"
+    depends_on:
+      db: { condition: service_healthy }
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        bench set-config -g db_type postgres;
+        bench set-config -g db_host db;
+        bench set-config -gp db_port 5432;
+        bench set-config -g redis_cache redis://redis-cache:6379;
+        bench set-config -g redis_queue redis://redis-queue:6379;
+        bench set-config -g redis_socketio redis://redis-queue:6379;
+        bench set-config -gp socketio_port 9000;
+
+  backend:
+    <<: *erpnext
+    mem_limit: 1536m
+    environment:
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-3}
+      GUNICORN_TIMEOUT: "120"
+
+  websocket:
+    <<: *erpnext
+    mem_limit: 256m
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/realtime/index.js"]
+
+  frontend:
+    <<: *erpnext
+    mem_limit: 128m
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      FRAPPE_SITE_NAME_HEADER: ${ERP_SITE:?}
+      TRUST_UPSTREAM_FORWARDED_PROTO: "on"   # Cloudflare Tunnel sends X-Forwarded-Proto: https
+      UPSTREAM_REAL_IP_ADDRESS: 0.0.0.0/0
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "on"
+      PROXY_READ_TIMEOUT: "120"
+      CLIENT_MAX_BODY_SIZE: 50m
+    ports: ["127.0.0.1:${ERP_PORT:-8010}:8080"]
+    depends_on:
+      backend: { condition: service_started }
+      websocket: { condition: service_started }
+
+  queue-short:
+    <<: *erpnext
+    mem_limit: 768m
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: *erpnext
+    mem_limit: 768m
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  scheduler:
+    <<: *erpnext
+    mem_limit: 384m
+    command: ["bench", "schedule"]
+
+  # Migrations of the MES and both bridges, as the owning role, before any of them starts.
+  platform-migrate:
+    <<: *platform
+    restart: "no"
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      MES_DB_OWNER_URL: postgres://kgarden_mes_owner:${KG_MES_OWNER_PASSWORD:?}@db:5432/kgarden_mes
+    entrypoint: ["sh", "-c", "mes migrate && wms-bridge migrate && cerp-bridge migrate"]
+
+  mes:
+    <<: *platform
+    mem_limit: 256m
+    command: ["mes", "serve"]
+    environment:
+      <<: *platform-env
+      MES_HTTP_ADDR: 0.0.0.0:8100
+      ERPNEXT_PUBLIC_URL: ${ERP_PUBLIC_URL:?}
+      ERPNEXT_API_KEY: ${MES_ERPNEXT_API_KEY:-}
+      ERPNEXT_API_SECRET: ${MES_ERPNEXT_API_SECRET:-}
+      MES_ACCESS_API_KEY: ${MES_ACCESS_API_KEY:-}
+      MES_ACCESS_API_SECRET: ${MES_ACCESS_API_SECRET:-}
+      MES_OIDC_CLIENT_ID: ${MES_OIDC_CLIENT_ID:-}
+      MES_OIDC_CLIENT_SECRET: ${MES_OIDC_CLIENT_SECRET:-}
+      MES_OIDC_REDIRECT_URI: ${MES_PUBLIC_URL:?}/auth/callback
+
+  floor:
+    image: kgarden/floor:${PLATFORM_TAG:-latest}
+    pull_policy: never
+    restart: unless-stopped
+    logging: *log
+    networks: [kgarden]
+    mem_limit: 64m
+    ports: ["127.0.0.1:${MES_PORT:-8011}:8080"]
+    depends_on: [mes]
+
+  # Reads ConstructionERP (kgf_construction in kgf-postgres, on the shared "kgf" network).
+  cerp-bridge:
+    <<: *platform
+    mem_limit: 128m
+    networks: [kgarden, kgf]
+    command: ["cerp-bridge", "serve"]
+    environment:
+      <<: *platform-env
+      CERP_BRIDGE_HTTP_ADDR: 0.0.0.0:8102
+      CERP_DB_URL: ${CERP_DB_URL:?}
+      CERP_ERPNEXT_API_KEY: ${CERP_ERPNEXT_API_KEY:-}
+      CERP_ERPNEXT_API_SECRET: ${CERP_ERPNEXT_API_SECRET:-}
+      CERP_BRIDGE_COMPANY: ${CERP_BRIDGE_COMPANY:-KGF Construction}
+      CERP_BRIDGE_VAT_ACCOUNT: ${CERP_BRIDGE_VAT_ACCOUNT:-}
+      CERP_BRIDGE_WHT_ACCOUNT: ${CERP_BRIDGE_WHT_ACCOUNT:-}
+      CERP_BRIDGE_SUPPLIER_GROUP: ${CERP_BRIDGE_SUPPLIER_GROUP:-}
+
+  # Reads the WMS MySQL on the DigitalOcean droplet over Tailscale; off until that link exists.
+  wms-bridge:
+    <<: *platform
+    profiles: [wms]
+    mem_limit: 128m
+    command: ["wms-bridge", "serve"]
+    environment:
+      <<: *platform-env
+      WMS_BRIDGE_HTTP_ADDR: 0.0.0.0:8101
+      WMS_DB_DSN: ${WMS_DB_DSN:-}
+      ERPNEXT_API_KEY: ${WMS_ERPNEXT_API_KEY:-}
+      ERPNEXT_API_SECRET: ${WMS_ERPNEXT_API_SECRET:-}
+      WMS_BRIDGE_COMPANY: ${WMS_BRIDGE_COMPANY:-K Garden}
+      WMS_BRIDGE_PARENT_WAREHOUSE: ${WMS_BRIDGE_PARENT_WAREHOUSE:-}
+      WMS_BRIDGE_TRANSIT_WAREHOUSE: ${WMS_BRIDGE_TRANSIT_WAREHOUSE:-}
+      WMS_BRIDGE_WIP_WAREHOUSE: ${WMS_BRIDGE_WIP_WAREHOUSE:-}
+      WMS_BRIDGE_FG_STAGING_WAREHOUSE: ${WMS_BRIDGE_FG_STAGING_WAREHOUSE:-}
+
+networks:
+  kgarden: {}
+  kgf:
+    external: true
+
+volumes:
+  db: {}
+  redis-queue: {}
+  sites: {}
+  logs: {}
