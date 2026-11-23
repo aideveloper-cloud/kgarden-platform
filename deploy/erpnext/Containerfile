@@ -1,0 +1,36 @@
+# syntax=docker/dockerfile:1
+# ERPNext for K Garden: frappe + erpnext (our fork) + kgarden, at the exact commits we tested.
+# Layered on frappe/build + frappe/base (frappe_docker); the apps come from the build context
+# (shallow clones made by deploy/build-erpnext.sh), so nothing is fetched from GitHub here.
+ARG FRAPPE_BRANCH=develop
+FROM frappe/build:${FRAPPE_BRANCH} AS builder
+USER frappe
+COPY --chown=frappe:0 src /opt/src
+RUN bench init \
+		--frappe-path=/opt/src/frappe --frappe-branch=develop \
+		--no-procfile --no-backups --skip-redis-config-generation --verbose \
+		/home/frappe/frappe-bench \
+	&& cd /home/frappe/frappe-bench \
+	&& bench get-app --skip-assets /opt/src/erpnext \
+	&& bench get-app --skip-assets /opt/src/kgarden \
+	&& bench build \
+	&& echo "{}" > sites/common_site_config.json \
+	&& find apps -mindepth 1 -path "*/.git" | xargs rm -fr \
+	&& chmod -R g=u /home/frappe/frappe-bench
+
+FROM frappe/base:${FRAPPE_BRANCH} AS backend
+USER frappe
+COPY --from=builder --chown=frappe:0 /home/frappe/frappe-bench /home/frappe/frappe-bench
+WORKDIR /home/frappe/frappe-bench
+RUN chmod g=u /home/frappe/frappe-bench \
+	&& cp -r sites/assets assets && rm -rf sites/assets
+VOLUME ["/home/frappe/frappe-bench/sites", "/home/frappe/frappe-bench/logs"]
+USER root
+COPY main-entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY start.sh /usr/local/bin/start.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh /usr/local/bin/start.sh
+USER frappe
+ARG COMMITS=""
+LABEL org.kgarden.commits="${COMMITS}"
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["start.sh"]
