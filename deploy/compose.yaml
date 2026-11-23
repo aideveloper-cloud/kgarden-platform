@@ -3,8 +3,8 @@
 #   ERPNext  : frontend (nginx) <- backend (gunicorn), websocket, workers, scheduler; Postgres + Redis
 #   Platform : mes, cerp-bridge, wms-bridge (profile "wms") and the floor tablet UI
 #
-# Nothing listens outside 127.0.0.1: the host's Cloudflare Tunnel publishes
-#   ${ERP_HOST} -> 127.0.0.1:${ERP_PORT}     ${MES_HOST} -> 127.0.0.1:${MES_PORT}
+# Nothing listens outside 127.0.0.1 (those ports are for checks on the server). The public names come
+# from K Garden's own Cloudflare Tunnel (service "tunnel"): ERP -> http://frontend:8080, MES -> http://floor:8080.
 # Secrets live in deploy/.env (mode 600) next to this file; see .env.example.
 name: kgarden
 
@@ -212,6 +212,20 @@ services:
       WMS_BRIDGE_TRANSIT_WAREHOUSE: ${WMS_BRIDGE_TRANSIT_WAREHOUSE:-}
       WMS_BRIDGE_WIP_WAREHOUSE: ${WMS_BRIDGE_WIP_WAREHOUSE:-}
       WMS_BRIDGE_FG_STAGING_WAREHOUSE: ${WMS_BRIDGE_FG_STAGING_WAREHOUSE:-}
+
+  # K Garden's own Cloudflare Tunnel (remote-managed: hostnames are set in the dashboard).
+  # Routes: ERP host -> http://frontend:8080, MES host -> http://floor:8080. Runs when CF_TUNNEL_TOKEN is set.
+  tunnel:
+    image: cloudflare/cloudflared:2026.10.0
+    profiles: [tunnel]
+    restart: unless-stopped
+    logging: *log
+    networks: [kgarden]
+    mem_limit: 128m
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:-}
+    depends_on: [frontend, floor]
 
 networks:
   kgarden: {}

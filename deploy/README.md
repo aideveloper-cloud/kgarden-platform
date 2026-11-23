@@ -13,9 +13,11 @@ over Tailscale). One compose project, `kgarden`, next to the other KGF apps in `
 | `cerp-bridge` | ConstructionERP → ERPNext; reads `kgf_construction` in `kgf-postgres` (network `kgf`) | 128 MB |
 | `wms-bridge` | WMS → ERPNext (profile `wms`, `WMS_ENABLED=1`): needs the WMS MySQL on Tailscale | 128 MB |
 
-Nothing listens beyond 127.0.0.1. The host's Cloudflare Tunnel (the one already serving
-`construction.kgarden.co.th`) publishes `ERP_HOST → 127.0.0.1:8010` and `MES_HOST → 127.0.0.1:8011`;
-add those public hostnames in the Cloudflare dashboard.
+Nothing listens beyond 127.0.0.1 (8010/8011 are for checks on the server). The public names come
+from K Garden's own Cloudflare Tunnel `kgarden`, run by the `tunnel` service once `CF_TUNNEL_TOKEN`
+is in `.env`. Its public hostnames, set in the dashboard: `erp.kgarden.co.th → http://frontend:8080`,
+`mes.kgarden.co.th → http://floor:8080`. (`construction.kgarden.co.th` goes through `iso-tunnel`,
+which is configured by a file, so dashboard hostnames do not apply to it.)
 
 ## Images
 

@@ -23,6 +23,7 @@ set -a; . "$ENV_FILE"; set +a
 profiles=()
 [[ ${WMS_ENABLED:-0} == 1 ]] && profiles+=(--profile wms)
 [[ ${CERP_ENABLED:-0} == 1 ]] && profiles+=(--profile cerp)
+[[ -n ${CF_TUNNEL_TOKEN:-} ]] && profiles+=(--profile tunnel)
 dc() { docker compose --env-file "$ENV_FILE" ${profiles[@]+"${profiles[@]}"} "$@"; }  # bash 3.2-safe
 site_bench() { dc exec -T backend bench --site "$ERP_SITE" "$@"; }
 
