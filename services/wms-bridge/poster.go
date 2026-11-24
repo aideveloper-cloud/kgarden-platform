@@ -20,8 +20,8 @@ type Config struct {
 	Company          string // ERPNext company, e.g. "K Garden"
 	ParentWarehouse  string // group warehouse new WMS warehouses are created under
 	TransitWarehouse string // where stock sits between TRANSFER_OUT and TRANSFER_IN
-	WIPWarehouse     string // raw material cut or consumed for production goes here; the MES backflushes from it
-	FGStaging        string // finished goods the MES produced wait here until the WMS receives them
+	WIPWarehouse     string // raw material cut or consumed for production goes here; Work Orders backflush from it
+	FGStaging        string // legacy (separate MES): finished goods waited here until the FG POS received them; leave empty
 	CreateMasters    bool   // create missing Items, UOMs and Warehouses in ERPNext
 	MaxAttempts      int
 }
@@ -43,7 +43,7 @@ type event struct {
 	LedgerID                                   int64
 	Movement, SKU, Domain, Title, WarehouseWMS string
 	Qty, UOM, UnitCost, RefType, Operator      string
-	Notes                                      string
+	Notes, WorkOrder                           string
 	RefID                                      *int64
 	PostedAt                                   time.Time
 	Attempts                                   int
@@ -69,14 +69,14 @@ func (p *Poster) processOne(ctx context.Context) (bool, error) {
 		var ev event
 		err := tx.QueryRow(ctx, `
 			SELECT e.ledger_id, e.movement_type, e.sku, e.domain, e.product_title, e.wms_warehouse, e.qty::text, e.uom,
-				e.unit_cost::text, e.reference_type, e.operator, e.notes, e.reference_id, e.posted_at, e.attempts,
+				e.unit_cost::text, e.reference_type, e.operator, e.notes, e.work_order, e.reference_id, e.posted_at, e.attempts,
 				coalesce(m.erpnext_warehouse, ''), coalesce(m.wms_name, e.wms_warehouse)
 			FROM wms_bridge.ledger_event e
 			LEFT JOIN wms_bridge.warehouse_map m ON m.org_id = e.org_id AND m.wms_code = e.wms_warehouse
 			WHERE e.status = 'pending' AND e.next_attempt_at <= now()
 			ORDER BY e.ledger_id LIMIT 1 FOR UPDATE OF e SKIP LOCKED`).Scan(
 			&ev.LedgerID, &ev.Movement, &ev.SKU, &ev.Domain, &ev.Title, &ev.WarehouseWMS, &ev.Qty, &ev.UOM,
-			&ev.UnitCost, &ev.RefType, &ev.Operator, &ev.Notes, &ev.RefID, &ev.PostedAt, &ev.Attempts,
+			&ev.UnitCost, &ev.RefType, &ev.Operator, &ev.Notes, &ev.WorkOrder, &ev.RefID, &ev.PostedAt, &ev.Attempts,
 			&ev.Warehouse, &ev.WarehouseName)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -95,8 +95,8 @@ func (p *Poster) processOne(ctx context.Context) (bool, error) {
 
 		attempts := ev.Attempts + 1
 		slog.Warn("wms ledger event failed", "ledger_id", ev.LedgerID, "attempt", attempts, "err", err)
-		// Not enough stock yet (e.g. FG received in the WMS before the MES reported it): wait for
-		// the other side instead of giving up.
+		// Not enough stock yet (e.g. output reported before the RM POS cut the materials into WIP):
+		// wait for the other side instead of giving up.
 		if attempts >= p.cfg.MaxAttempts && !erpnext.IsNegativeStock(err) {
 			_, uerr := tx.Exec(ctx, `UPDATE wms_bridge.ledger_event SET status = 'dead', attempts = $2, last_error = $3
 				WHERE ledger_id = $1`, ev.LedgerID, attempts, err.Error())
@@ -133,7 +133,12 @@ func (p *Poster) post(ctx context.Context, tx pgx.Tx, ev *event) (string, error)
 		if err := p.ensureMasters(ctx, tx, ev); err != nil {
 			return "", err
 		}
-		doc, err := p.buildEntry(ev, key)
+		var doc map[string]any
+		if ev.isProductionOutput() {
+			doc, err = p.buildManufacture(ctx, ev, key)
+		} else {
+			doc, err = p.buildEntry(ev, key)
+		}
 		if err != nil {
 			return "", err
 		}
@@ -150,7 +155,9 @@ func (p *Poster) post(ctx context.Context, tx pgx.Tx, ev *event) (string, error)
 	return "", errors.New("stock entry key conflict did not resolve")
 }
 
-// Production flow rules (decided 2026-11-18: WMS moves raw material to WIP, MES backflushes).
+// Production flow rules (2026-11-18: WMS moves raw material to WIP, Work Orders backflush from it;
+// 2026-11-24: the shop floor is the WMS production POS, whose output is received straight into a
+// WMS warehouse and posted here as a Manufacture entry).
 // The WMS marks each posting with the flow that made it (reference_type).
 var (
 	// Raw material leaving a warehouse for production: the RM tablet "cut" and Spoolman filament use.
@@ -231,6 +238,66 @@ func (p *Poster) buildEntry(ev *event, key string) (map[string]any, error) {
 		"remarks":            remarks,
 		"items":              []any{item},
 	}, nil
+}
+
+// productionOutputRef marks finished goods reported at the WMS production POS.
+const productionOutputRef = "production_output"
+
+func (ev *event) isProductionOutput() bool {
+	return ev.RefType == productionOutputRef && ev.WorkOrder != "" && !strings.HasPrefix(ev.Qty, "-")
+}
+
+// buildManufacture asks ERPNext for the Manufacture entry of this Work Order and quantity (BOM
+// materials backflushed from WIP, as the kgarden Work Order rule sets) and sends the finished goods
+// to the WMS warehouse they were received into instead of the Work Order's own FG warehouse.
+func (p *Poster) buildManufacture(ctx context.Context, ev *event, key string) (map[string]any, error) {
+	doc, err := p.erp.MakeManufactureEntry(ctx, ev.WorkOrder, ev.Qty)
+	if err != nil {
+		return nil, fmt.Errorf("manufacture entry for %s: %w", ev.WorkOrder, err)
+	}
+	items, _ := doc["items"].([]any)
+	finished := 0
+	for _, raw := range items {
+		row, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fin, _ := row["is_finished_item"].(float64); fin == 1 || (row["item_code"] == ev.SKU && row["t_warehouse"] != nil && row["s_warehouse"] == nil) {
+			row["t_warehouse"] = ev.Warehouse
+			finished++
+		}
+		// Materials the WMS received without a cost carry a zero rate into WIP (see buildEntry);
+		// ERPNext would refuse to consume them, so the same allowance follows them here. Consumed
+		// rows keep their real valuation; the flag only stops the error when it is zero. Never on
+		// the finished good: there it would book the output at zero instead of the material cost.
+		if src, _ := row["s_warehouse"].(string); src != "" && row["t_warehouse"] == nil {
+			row["allow_zero_valuation_rate"] = 1
+		}
+	}
+	if finished == 0 {
+		return nil, fmt.Errorf("manufacture entry for %s has no finished item row for %s", ev.WorkOrder, ev.SKU)
+	}
+	local := ev.PostedAt.In(wmsLocation)
+	remarks := fmt.Sprintf("WMS ledger #%d · ผลิตเสร็จตาม %s · เข้าคลัง %s · รายงานเมื่อ %s",
+		ev.LedgerID, ev.WorkOrder, ev.WarehouseName, local.Format("2006-01-02 15:04"))
+	if ev.Operator != "" {
+		remarks += " · ผู้ทำรายการ: " + ev.Operator
+	}
+	// Booked when it was reported, unless an earlier try failed (typically: its materials were not
+	// in WIP yet). Then it is booked now: a backdated entry would still find WIP short at the report
+	// time, because the cut that brought the materials is dated later, and would never go through.
+	if ev.Attempts == 0 {
+		doc["set_posting_time"] = 1
+		doc["posting_date"] = local.Format("2006-01-02")
+		doc["posting_time"] = local.Format("15:04:05")
+	} else {
+		doc["set_posting_time"] = 0
+		delete(doc, "posting_date")
+		delete(doc, "posting_time")
+	}
+	doc["kg_idempotency_key"] = key
+	doc["remarks"] = remarks
+	return doc, nil
 }
 
 // ensureMasters makes sure the warehouse, UOM and item an event needs exist in ERPNext.

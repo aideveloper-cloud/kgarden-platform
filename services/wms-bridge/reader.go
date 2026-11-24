@@ -30,6 +30,7 @@ type ledgerRow struct {
 	WarehouseCode, WarehouseName string
 	Qty, UOM, UnitCost, PostedAt string
 	RefType, Operator, Notes     string
+	WorkOrder                    string // ERPNext Work Order of a production POS receipt
 	RefID                        sql.NullInt64
 	Settled                      bool
 }
@@ -90,7 +91,8 @@ func (r *Reader) page(ctx context.Context, after int64) ([]ledgerRow, error) {
 			CAST(l.qty AS CHAR), l.uom, CAST(coalesce(p.buy_price, 0) AS CHAR),
 			DATE_FORMAT(l.posted_at, '%Y-%m-%d %H:%i:%s'),
 			coalesce(l.reference_type, ''), l.reference_id, coalesce(l.operator_name, ''), coalesce(l.notes, ''),
-			DATE_FORMAT(l.created_at, '%Y-%m-%d %H:%i:%s')
+			DATE_FORMAT(l.created_at, '%Y-%m-%d %H:%i:%s'),
+			coalesce(JSON_UNQUOTE(JSON_EXTRACT(l.meta, '$.work_order')), '')
 		FROM stock_ledgers l
 		JOIN products p ON p.id = l.product_id
 		JOIN warehouses w ON w.id = l.warehouse_id
@@ -107,7 +109,7 @@ func (r *Reader) page(ctx context.Context, after int64) ([]ledgerRow, error) {
 		var x ledgerRow
 		var createdAt string
 		if err := rows.Scan(&x.ID, &x.Movement, &x.SKU, &x.Title, &x.Domain, &x.WarehouseCode, &x.WarehouseName,
-			&x.Qty, &x.UOM, &x.UnitCost, &x.PostedAt, &x.RefType, &x.RefID, &x.Operator, &x.Notes, &createdAt); err != nil {
+			&x.Qty, &x.UOM, &x.UnitCost, &x.PostedAt, &x.RefType, &x.RefID, &x.Operator, &x.Notes, &createdAt, &x.WorkOrder); err != nil {
 			return nil, err
 		}
 		created, err := time.ParseInLocation(time.DateTime, createdAt, wmsLocation)
@@ -126,12 +128,12 @@ func (r *Reader) record(ctx context.Context, rows []ledgerRow) (int, error) {
 		for _, x := range rows {
 			tag, err := tx.Exec(ctx, `
 				INSERT INTO wms_bridge.ledger_event (org_id, ledger_id, movement_type, sku, domain, product_title,
-					wms_warehouse, qty, uom, unit_cost, posted_at, reference_type, reference_id, operator, notes)
+					wms_warehouse, qty, uom, unit_cost, posted_at, reference_type, reference_id, operator, notes, work_order)
 				VALUES (wms_bridge.current_org(), $1, $2, $3, $4, $5, $6, $7::numeric, $8, $9::numeric,
-					$10::timestamp AT TIME ZONE $11, $12, $13, $14, $15)
+					$10::timestamp AT TIME ZONE $11, $12, $13, $14, $15, $16)
 				ON CONFLICT DO NOTHING`,
 				x.ID, x.Movement, x.SKU, x.Domain, x.Title, x.WarehouseCode, x.Qty, x.UOM, x.UnitCost,
-				x.PostedAt, wmsTimezone, x.RefType, x.RefID, x.Operator, x.Notes)
+				x.PostedAt, wmsTimezone, x.RefType, x.RefID, x.Operator, x.Notes, x.WorkOrder)
 			if err != nil {
 				return fmt.Errorf("record ledger %d: %w", x.ID, err)
 			}
